@@ -1,0 +1,2169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Koi — Connexion</title>
+  <meta name="description" content="A login card laid on an ink-painted koi pond: the koi swim around it, come close when you type, scatter on a wrong password and bloom into colour when you get in." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;1,400&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f8f6f1;
+      -webkit-font-smoothing: antialiased;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    koi-login {
+      display: block;
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+      cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <koi-login></koi-login>
+
+  <script>
+  (() => {
+    'use strict';
+
+    /* =====================================================================
+       DETERMINISTIC PRNG & MULTI-OCTAVE NOISE (same as the dragon page)
+       ===================================================================== */
+    function mulberry32(seed) {
+      let a = seed >>> 0;
+      return function () {
+        a |= 0;
+        a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    const PERM = new Uint8Array(512);
+    const GRADX = new Float32Array(256);
+    const GRADY = new Float32Array(256);
+    {
+      const rng = mulberry32(0x5a1a9a2d);
+      const p = new Uint8Array(256);
+      for (let i = 0; i < 256; i++) {
+        p[i] = i;
+        const ang = rng() * Math.PI * 2;
+        GRADX[i] = Math.cos(ang);
+        GRADY[i] = Math.sin(ang);
+      }
+      for (let i = 255; i > 0; i--) {
+        const j = (rng() * (i + 1)) | 0;
+        const tmp = p[i];
+        p[i] = p[j];
+        p[j] = tmp;
+      }
+      for (let i = 0; i < 512; i++) PERM[i] = p[i & 255];
+    }
+
+    function noise2D(x, y) {
+      const xi = Math.floor(x);
+      const yi = Math.floor(y);
+      const xf = x - xi;
+      const yf = y - yi;
+      const X = xi & 255;
+      const Y = yi & 255;
+      const u = xf * xf * xf * (xf * (xf * 6 - 15) + 10);
+      const v = yf * yf * yf * (yf * (yf * 6 - 15) + 10);
+      const aa = PERM[PERM[X] + Y];
+      const ab = PERM[PERM[X] + Y + 1];
+      const ba = PERM[PERM[X + 1] + Y];
+      const bb = PERM[PERM[X + 1] + Y + 1];
+      const g00 = GRADX[aa] * xf + GRADY[aa] * yf;
+      const g10 = GRADX[ba] * (xf - 1) + GRADY[ba] * yf;
+      const g01 = GRADX[ab] * xf + GRADY[ab] * (yf - 1);
+      const g11 = GRADX[bb] * (xf - 1) + GRADY[bb] * (yf - 1);
+      const nx0 = g00 + u * (g10 - g00);
+      const nx1 = g01 + u * (g11 - g01);
+      return (nx0 + v * (nx1 - nx0)) * 0.7071 + 0.5;
+    }
+
+    function fbm2D(x, y, octaves = 4) {
+      let sum = 0;
+      let amp = 0.5;
+      let freq = 1;
+      let norm = 0;
+      for (let i = 0; i < octaves; i++) {
+        sum += amp * noise2D(x * freq, y * freq);
+        norm += amp;
+        amp *= 0.5;
+        freq *= 2.03;
+      }
+      return sum / norm;
+    }
+
+    function hexToRgb(hex) {
+      const n = parseInt(hex.replace('#', ''), 16);
+      return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+    }
+    function hexToRgbNorm(hex) {
+      const [r, g, b] = hexToRgb(hex);
+      return [r / 255, g / 255, b / 255];
+    }
+    function lerp(a, b, t) { return a + (b - a) * t; }
+    function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+    function smoothstep(e0, e1, x) {
+      const t = clamp((x - e0) / (e1 - e0), 0, 1);
+      return t * t * (3 - 2 * t);
+    }
+    function wrapAngle(a) {
+      while (a > Math.PI) a -= Math.PI * 2;
+      while (a < -Math.PI) a += Math.PI * 2;
+      return a;
+    }
+
+    const PALETTE = { paper: '#f8f6f1', labelInk: '#6b645b' };
+
+    /* =====================================================================
+       COLD-PRESS WATERCOLOUR SHEET (baked on resize, same as the dragon page)
+       ===================================================================== */
+    function buildPaperCanvas(width, height, palette, isDark, washSeed = 7) {
+      const scale = 0.55;
+      const w = Math.max(360, Math.round(width * scale));
+      const h = Math.max(220, Math.round(height * scale));
+      const cvs = document.createElement('canvas');
+      cvs.width = w;
+      cvs.height = h;
+      const ctx = cvs.getContext('2d');
+      const img = ctx.createImageData(w, h);
+      const data = img.data;
+      const [pr, pg, pb] = hexToRgb(palette.paper);
+      const so = washSeed * 13.7;
+      for (let y = 0; y < h; y++) {
+        const ny = y / h;
+        for (let x = 0; x < w; x++) {
+          const nx = x / w;
+          // Paper body: faint cockling (the sheet buckles where it was wet)
+          const cockle = fbm2D(nx * 2.2 + so, ny * 2.2 - so, 3) - 0.5;
+          const mottle = fbm2D(nx * 9.0 + 3.1, ny * 9.0 + 7.7, 3) - 0.5;
+          const lift = cockle * (isDark ? 6 : 9) + mottle * (isDark ? 3 : 4);
+          const idx = (y * w + x) * 4;
+          data[idx] = clamp(pr + lift, 0, 255);
+          data[idx + 1] = clamp(pg + lift, 0, 255);
+          data[idx + 2] = clamp(pb + lift * 1.04, 0, 255);
+          data[idx + 3] = 255;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+      return cvs;
+    }
+
+    /* =====================================================================
+       SHADERS
+       ===================================================================== */
+    const HEAD = `#version 300 es
+      precision highp float;
+      #define texture2D texture
+    `;
+
+    // Paper noise, cold-press tooth and absorbance: the dragon page's code, verbatim
+    const GLSL_PAPER = `
+      float hash21(vec2 p) {
+        p = fract(p * vec2(127.1, 311.7));
+        p += dot(p, p + 34.23);
+        return fract(p.x * p.y);
+      }
+      float vnoise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        float a = hash21(i);
+        float b = hash21(i + vec2(1.0, 0.0));
+        float c = hash21(i + vec2(0.0, 1.0));
+        float d = hash21(i + vec2(1.0, 1.0));
+        return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+      }
+      float fiberFbm(vec2 p) {
+        float s = 0.0;
+        s += 0.50 * vnoise(p);
+        s += 0.28 * vnoise(p * 2.13 + vec2(11.3, 7.1));
+        s += 0.14 * vnoise(p * 4.41 + vec2(23.7, 19.4));
+        s += 0.08 * vnoise(p * 9.10 + vec2(5.2, 41.8));
+        return s;
+      }
+      // Cold-press tooth: rounded felt-pressed hills (cellular) over fibre noise
+      vec2 hash22(vec2 p) {
+        return vec2(hash21(p), hash21(p + 19.19));
+      }
+      float cellHills(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        float d = 1.0;
+        for (int y = -1; y <= 1; y++) {
+          for (int x = -1; x <= 1; x++) {
+            vec2 o = vec2(float(x), float(y));
+            vec2 c = o + 0.15 + 0.7 * hash22(i + o) - f;
+            d = min(d, dot(c, c));
+          }
+        }
+        return 1.0 - sqrt(d);
+      }
+      float toothH(vec2 px) {
+        float h = 0.58 * cellHills(px / 7.5);
+        h += 0.17 * cellHills(px / 3.4 + 11.7);
+        h += 0.25 * vnoise(px * 0.7);
+        return h;
+      }
+      // Absorbance of a pigment that looks like col at full strength on white
+      vec3 absorb(vec3 col) {
+        return -log(max(col, vec3(0.02)));
+      }
+      float sq(float x) { return x * x; }
+    `;
+
+    const VS_FULL = HEAD + `
+      in vec2 aPos;
+      out vec2 vUv;
+      void main() {
+        vUv = aPos * 0.5 + 0.5;
+        gl_Position = vec4(aPos, 0.0, 1.0);
+      }
+    `;
+
+    // Baked once per resize: the sheet with its tooth, raking light and granulation.
+    // Alpha keeps the tooth height so pigment can settle into the hollows later.
+    const FS_PAPER = HEAD + `
+      in vec2 vUv;
+      out vec4 fragColor;
+      uniform sampler2D uPaperTex;
+      uniform vec2 uRes;
+      uniform float uIsDark;
+      uniform vec3 uPaperCol;
+      ${GLSL_PAPER}
+      vec3 paperSurface(vec2 uv, vec2 px) {
+        vec3 c = texture2D(uPaperTex, uv).rgb;
+        float h = toothH(px);
+        float hx = toothH(px + vec2(1.0, 0.0)) - h;
+        float hy = toothH(px + vec2(0.0, 1.0)) - h;
+        // light from the upper left (px y grows downward)
+        vec3 n = normalize(vec3(-hx * 1.6, -hy * 1.6, 1.0));
+        vec3 L = normalize(vec3(-0.55, -0.62, 0.56));
+        float shade = dot(n, L) / L.z;
+        // pigment settles in the hollows and skips the hilltops
+        vec3 pig = clamp(1.0 - c / max(uPaperCol, vec3(0.05)), 0.0, 1.0);
+        float valley = 1.0 - smoothstep(0.25, 0.75, h);
+        float g = 0.88 + 0.26 * valley; // < 1 on hilltops, > 1 in hollows
+        vec3 col = uIsDark > 0.5 ? c : max(c - uPaperCol * pig * (g - 1.0), vec3(0.0));
+        col *= mix(1.0, shade, uIsDark > 0.5 ? 0.08 : 0.13);
+        // occasional cotton fibre glint
+        col += (smoothstep(0.93, 0.99, vnoise(px * vec2(0.35, 2.2) + 7.0)) * 0.018) * (1.0 - uIsDark);
+        return col;
+      }
+      void main() {
+        vec2 uv = vec2(vUv.x, 1.0 - vUv.y);
+        vec2 px = uv * uRes;
+        fragColor = vec4(paperSurface(uv, px), clamp(toothH(px), 0.0, 1.0));
+      }
+    `;
+
+    // Static noise the painting reuses every frame, baked with the paper
+    const FS_NOISE = HEAD + `
+      in vec2 vUv;
+      out vec4 fragColor;
+      uniform vec2 uRes;
+      ${GLSL_PAPER}
+      void main() {
+        vec2 px = vec2(vUv.x, 1.0 - vUv.y) * uRes;
+        fragColor = vec4(vnoise(px * 0.045), fiberFbm(px * 0.11 + 3.0), vnoise(px * 0.32 + 17.0), fiberFbm(px * 0.21 + 9.0));
+      }
+    `;
+
+    // Geometry in page pixels (y down) for the fish strips and the floating leaves
+    const VS_STRIP = HEAD + `
+      in vec2 aPos;
+      in vec2 aLoc;
+      in vec4 aP0;
+      in vec4 aP1;
+      uniform vec2 uRes;
+      out vec2 vLoc;
+      flat out vec4 vP0;
+      flat out vec4 vP1;
+      void main() {
+        vLoc = aLoc;
+        vP0 = aP0;
+        vP1 = aP1;
+        gl_Position = vec4(aPos.x / uRes.x * 2.0 - 1.0, 1.0 - aPos.y / uRes.y * 2.0, 0.0, 1.0);
+      }
+    `;
+
+    /* The koi, painted in body space so every brush mark swims with the fish.
+       Target 0: rgb = the colour the fish turns when wet (absorbance), a = sumi that never washes out.
+       Target 1: r = the grey wash it shows while dry, g = coverage, b = fin-ness. */
+    const FS_FISH = HEAD + `
+      in vec2 vLoc;
+      flat in vec4 vP0;
+      flat in vec4 vP1;
+      uniform float uEnc;
+      layout(location = 0) out vec4 o0;
+      layout(location = 1) out vec4 o1;
+      ${GLSL_PAPER}
+      // octaves rotated against each other so nothing lines up with the noise grid
+      float softFbm(vec2 p) {
+        const mat2 R = mat2(0.80, 0.60, -0.60, 0.80);
+        float s = 0.0, a = 0.5;
+        for (int i = 0; i < 4; i++) {
+          s += a * vnoise(p);
+          p = R * p * 2.07 + vec2(13.1, 7.7);
+          a *= 0.5;
+        }
+        return s / 0.9375;
+      }
+      float W;
+      float bodyW(float u) {
+        float front = sqrt(clamp(1.0 - sq((0.30 - u) / 0.31), 0.0, 1.0));
+        float back = 1.0 - 0.80 * smoothstep(0.30, 0.82, u);
+        return W * (u < 0.30 ? front : back);
+      }
+      float fin(vec2 p, float ang, float len, float wid, float en, out float ray) {
+        vec2 dir = vec2(cos(ang), sin(ang));
+        vec2 nrm = vec2(-dir.y, dir.x);
+        float t = dot(p, dir) / len;
+        float q = dot(p, nrm) / len;
+        float hw = wid * pow(clamp(t, 0.0, 1.0), 0.55) * (1.25 - 0.55 * t);
+        float m = smoothstep(-0.05, 0.05, t)
+          * (1.0 - smoothstep(0.7, 1.0, abs(q) / max(hw, 1e-3) + en))
+          * (1.0 - smoothstep(0.8, 1.0, t + en * 0.5 + abs(q) * 0.5));
+        float ra = atan(q, max(t, 1e-3));
+        float streak = vnoise(vec2(ra * 9.0 + 3.0, t * 2.2));
+        ray = m * smoothstep(0.45, 0.85, streak) * pow(abs(sin(ra * 7.0 + t * 1.2)), 3.0) * (1.0 - 0.6 * t);
+        return m * (1.0 - 0.55 * t);
+      }
+      void main() {
+        float seed = vP0.x;
+        int type = int(vP0.y + 0.5);
+        float L = vP0.z;
+        W = vP0.w;
+        float flapL = vP1.x;
+        float flapR = vP1.y;
+        float depth = vP1.z;
+        float bfly = vP1.w;
+
+        float u = vLoc.x;
+        float sL = vLoc.y / L;
+        float as = abs(sL);
+        vec2 sd = fract(seed * vec2(0.137, 0.291)) * vec2(37.0, 23.0);
+        vec2 bp = vec2(u, sL);
+
+        // ragged wet-brush edge
+        float en = (softFbm(bp * 20.0 + sd) - 0.5) * 0.32 + (softFbm(bp * 6.0 + sd.yx) - 0.5) * 0.2;
+        // dry-brush hairs run along the body (kept above pixel size so they never alias)
+        float brush = softFbm(vec2(u * L * 0.025, sL * L * 0.2) + sd);
+
+        // --- body ------------------------------------------------------------
+        float w = bodyW(u);
+        float d = as / max(w, 1e-4);
+        float bodyM = (1.0 - smoothstep(0.78, 1.0, d + en))
+          * (1.0 - smoothstep(0.80, 0.88, u + en * 0.04))
+          * smoothstep(-0.03, 0.0, u);
+
+        // --- tail: a forked fan that feathers out into the paper ---------------
+        float tailEnd = mix(1.0, 1.3, bfly);
+        float tl = (u - 0.78) / (tailEnd - 0.78);
+        float tw = W * (0.22 + 1.55 * pow(clamp(tl, 0.0, 1.0), 0.75)) * mix(1.0, 1.35, bfly);
+        float ts = as / tw;
+        float cut = 0.76 + 0.24 * ts;
+        float tailM = smoothstep(-0.02, 0.07, tl)
+          * (1.0 - smoothstep(0.78, 1.0, ts + en * 0.8))
+          * (1.0 - smoothstep(cut - 0.16, cut, tl + en * 0.3));
+        float tAng = atan(sL, max(u - 0.72, 1e-3));
+        float tRays = 0.6 + 0.6 * vnoise(vec2(tAng * 26.0 + seed, tl * 2.5));
+        float tRayLine = pow(abs(sin(tAng * 16.0 + (vnoise(vec2(tl * 3.0, seed)) - 0.5) * 2.5)), 4.0)
+          * smoothstep(0.35, 0.8, vnoise(vec2(tAng * 12.0 + seed, tl * 3.5)));
+        float tailDen = tailM * (0.62 - 0.36 * clamp(tl, 0.0, 1.0)) * tRays;
+
+        // --- pectoral and pelvic fins -----------------------------------------
+        float flap = sL < 0.0 ? flapL : flapR;
+        float r0 = bodyW(0.24) * 0.78;
+        float pRay;
+        float pec = fin(vec2(u - 0.24, as - r0), 0.5 + 0.8 * flap, mix(0.2, 0.33, bfly), 0.38, en, pRay);
+        float vRay;
+        float pel = fin(vec2(u - 0.52, as - bodyW(0.52) * 0.8), 0.62 + 0.2 * flap, mix(0.09, 0.16, bfly), 0.34, en, vRay);
+        float finM = max(pec, pel) * (0.55 + 0.5 * fiberFbm(vec2(u * 9.0, sL * 22.0) + sd));
+        float finRay = max(pRay, vRay);
+
+        // --- markings that stay sumi: the back, the dorsal line, eyes, gill -----
+        float spineW = w * 0.3 + 0.006;
+        float spine = exp(-sq(sL / spineW)) * smoothstep(0.03, 0.2, u) * (1.0 - smoothstep(0.5, 0.86, u));
+        float dorsal = exp(-sq(sL / (spineW * 0.4))) * smoothstep(0.28, 0.36, u) * (1.0 - smoothstep(0.6, 0.72, u));
+        float eu = 0.075;
+        float eye = 1.0 - smoothstep(0.009, 0.015, length(vec2(u - eu, as - bodyW(eu) * 0.68)));
+        float gillD = u - 0.175 + 0.55 * as * as / W;
+        float gill = exp(-sq(gillD / 0.006)) * smoothstep(0.35, 0.85, d) * bodyM;
+
+        // scale net
+        vec2 sg = vec2(u * 30.0, sL * 30.0);
+        sg.y += mod(floor(sg.x), 2.0) * 0.5;
+        vec2 sf = fract(sg) - 0.5;
+        float sc = abs(length(sf + vec2(0.4, 0.0)) - 0.5);
+        float net = (1.0 - smoothstep(0.05, 0.17, sc)) * smoothstep(0.12, 0.3, u) * (1.0 - smoothstep(0.66, 0.8, u)) * (1.0 - smoothstep(0.5, 0.95, d));
+
+        // --- the koi's colours --------------------------------------------------
+        vec2 pq = vec2(u * 4.4, sL / W * 1.1) + sd * 1.7;
+        pq += (vec2(softFbm(pq * 1.3 + 3.0), softFbm(pq * 1.3 + 9.0)) - 0.5) * 0.9;   // warp into soft, organic patches
+        float pn = softFbm(pq) + (softFbm(pq * 3.1 + 5.0) - 0.5) * 0.12;
+        float span = smoothstep(0.05, 0.13, u) * (1.0 - smoothstep(0.68, 0.8, u));
+        float pat = smoothstep(0.5, 0.54, pn) * span;
+        float blackP = 0.0;
+        float netW = 0.0;
+        vec3 base = vec3(0.975, 0.963, 0.94);
+        vec3 pc = vec3(0.86, 0.24, 0.13);
+        vec3 finCol = vec3(0.96, 0.94, 0.91);
+        if (type == 1) {           // sanke: kohaku with small sumi spots
+          blackP = smoothstep(0.66, 0.7, softFbm(pq * 2.2 + 9.0)) * span * (1.0 - smoothstep(0.6, 0.95, d));
+        } else if (type == 2) {    // showa: heavy sumi, red and white
+          blackP = smoothstep(0.5, 0.55, softFbm(pq * 1.2 + 21.0)) * smoothstep(0.02, 0.1, u);
+          pat *= 1.0 - blackP * 0.7;
+        } else if (type == 3) {    // ogon: all gold
+          base = vec3(0.93, 0.74, 0.32); pat = 0.0; finCol = vec3(0.95, 0.82, 0.5); netW = 0.1;
+        } else if (type == 4) {    // chagoi orange
+          base = vec3(0.95, 0.55, 0.2); pat = 0.0; finCol = vec3(0.96, 0.72, 0.45); netW = 0.12;
+        } else if (type == 5) {    // tancho: one red sun on the head
+          pat = 1.0 - smoothstep(0.045, 0.06, length(vec2((u - 0.14) * 1.1, sL * 1.2)));
+        } else if (type == 6) {    // asagi: indigo back, orange flanks
+          base = vec3(0.56, 0.64, 0.76);
+          pc = vec3(0.93, 0.5, 0.22);
+          pat = smoothstep(0.55, 0.85, d + en * 0.5) * smoothstep(0.08, 0.2, u);
+          finCol = vec3(0.95, 0.7, 0.5);
+          netW = 0.28;
+        }
+        vec3 Abase = absorb(base);
+        vec3 Apat = absorb(pc);
+        vec3 Abody = mix(Abase, Apat, pat) * (0.8 + 0.45 * brush);
+
+        float finsAll = max(finM, tailDen) * (1.0 - bodyM);
+        float cov = clamp(max(bodyM, max(max(pec, pel), tailM)), 0.0, 1.0);
+        float depthF = 1.0 - depth * 0.45;
+
+        vec3 A = Abody * bodyM + absorb(finCol) * finsAll * 0.9;
+        float sumi = spine * 0.5 * (0.5 + 0.8 * brush)
+          + dorsal * 0.32
+          + eye * 1.7
+          + blackP * bodyM * (0.85 + 0.3 * brush)
+          + gill * 0.22
+          + net * netW * bodyM
+          + (finRay * 0.16 + tRayLine * tailM * 0.13) * (1.0 - bodyM * 0.8);
+        float wash = bodyM * (0.22 + 0.3 * (Abody.r + Abody.g + Abody.b) / 3.0) * (0.75 + 0.5 * brush)
+          + finsAll * 0.2;
+
+        o0 = vec4(A, sumi) * depthF * uEnc;
+        o1 = vec4(wash * depthF, cov, finsAll, 0.0) * uEnc;
+      }
+    `;
+
+    /* Lotus leaves, flowers and loose petals in ink and wash.
+       r = how much it hides the water beneath, g = sumi, b = jade wash, a = rose wash */
+    const FS_LEAF = HEAD + `
+      in vec2 vLoc;
+      flat in vec4 vP0;
+      flat in vec4 vP1;
+      out vec4 o;
+      ${GLSL_PAPER}
+      // a pointed lotus petal: q.x runs from base (0) to tip (1)
+      float petal(vec2 q, float wid, float en, out float edge, out float tip) {
+        float t = q.x;
+        float hw = wid * pow(clamp(t, 0.0, 1.0), 0.6) * pow(clamp(1.0 - t, 0.0, 1.0), 0.45) * 1.9;
+        float e = abs(q.y) / max(hw, 1e-4);
+        float m = smoothstep(-0.02, 0.04, t) * (1.0 - smoothstep(0.94, 1.02, t + en * 0.1)) * (1.0 - smoothstep(0.82, 1.0, e + en));
+        edge = exp(-sq((e - 0.93) / 0.12)) * step(0.0, t) * step(t, 1.0);
+        tip = t;
+        return m;
+      }
+      void main() {
+        int type = int(vP0.x + 0.5);
+        float seed = vP0.y;
+        vec2 p = vLoc;
+        float r = length(p);
+        float a = atan(p.y, p.x);
+        float en = (fiberFbm(p * 6.0 + seed) - 0.5) * 0.16;
+        float cover = 0.0, ink = 0.0, jade = 0.0, rose = 0.0;
+
+        if (type == 0) {
+          // floating leaf: a loose wash with a pooled rim, a few broken veins and its notch
+          float edgeR = 0.95 + 0.07 * (vnoise(vec2(a * 1.3 + seed, seed)) - 0.5) + 0.03 * (vnoise(vec2(a * 4.0, seed + 5.0)) - 0.5);
+          float notch = smoothstep(0.05, 0.14, abs(a) + (1.0 - r) * 0.025);
+          float rr = r + en * 0.55 + (fiberFbm(p * 16.0 + seed) - 0.5) * 0.05;
+          float m = (1.0 - smoothstep(edgeR - 0.07, edgeR + 0.01, rr)) * notch;
+          float halo = (1.0 - smoothstep(edgeR, edgeR + 0.12, rr)) * (1.0 - m) * notch;
+          float load = fiberFbm(p * 1.9 + seed * 1.3);
+          float bloom = fiberFbm(p * 1.7 + seed + 9.0);
+          float bloomRim = exp(-sq((bloom - 0.55) / 0.025)) * m;      // cauliflower backruns
+          float lift = smoothstep(0.55, 0.75, bloom) * m;                      // pale where water crept back
+          float pool = exp(-max(edgeR - rr, 0.0) / 0.05) * m;
+          float tone = smoothstep(0.35, 0.65, fiberFbm(p * 1.2 + seed + 3.0));
+          float va = a / 6.28318 * 11.0 + 0.5 + 0.03 * sin(r * 5.0 + seed);
+          float vv = abs(fract(va) - 0.5) * 6.28318 / 11.0 * r;
+          float vein = (1.0 - smoothstep(0.003, 0.012, vv)) * smoothstep(0.08, 0.3, r) * (1.0 - smoothstep(0.7, 0.9, r)) * m
+                     * smoothstep(0.3, 0.6, vnoise(vec2(floor(va) * 3.7 + seed, r * 4.0)));
+          float stroke = exp(-sq((rr - edgeR + 0.025) / 0.02)) * smoothstep(0.45, 0.75, vnoise(vec2(a * 1.4 + seed, 3.0))) * notch;
+          float centre = exp(-r * r / 0.0015);
+          cover = m;
+          float body = (0.14 + 0.3 * load) * (1.0 - lift * 0.55);
+          jade = m * body * mix(1.0, 0.55, tone) + pool * 0.22 + bloomRim * 0.12 + halo * 0.03;
+          ink = m * body * mix(0.15, 0.5, tone) + pool * 0.16 + bloomRim * 0.08 + vein * 0.12 + stroke * 0.35 + centre * 0.35 + halo * 0.02;
+        } else if (type == 1) {
+          // lotus flower from above: two rings of petals around the seed pod
+          float wobble = vP0.z;
+          for (int k = 0; k < 15; k++) {
+            float fk = float(k);
+            bool inner = k >= 8;
+            float n = inner ? 7.0 : 8.0;
+            float idx = inner ? fk - 8.0 : fk;
+            float ang = (idx + (inner ? 0.5 : 0.0)) / n * 6.28318 + seed + (hash21(vec2(fk, seed)) - 0.5) * 0.25;
+            float len = inner ? 0.66 : 0.98;
+            float base = inner ? 0.06 : 0.1;
+            vec2 dir = vec2(cos(ang), sin(ang));
+            vec2 q = vec2(dot(p, dir) - base, dot(p, vec2(-dir.y, dir.x))) / len;
+            q.y += 0.05 * sin(wobble + fk);
+            float edge, tip;
+            float m = petal(q, inner ? 0.36 : 0.4, en, edge, tip);
+            cover = max(cover, m);
+            float lp = fiberFbm(q * 5.0 + fk + seed);
+            rose += m * (0.1 + 0.62 * pow(clamp(tip, 0.0, 1.0), 1.4)) * (0.7 + 0.6 * lp) * (inner ? 0.8 : 1.0);
+            ink += edge * m * 0.22 * smoothstep(0.35, 0.7, vnoise(vec2(fk * 3.1 + tip * 3.0, seed)));
+          }
+          float pod = 1.0 - smoothstep(0.15, 0.19, r + en * 0.2);
+          float seeds = 0.0;
+          for (int s = 0; s < 7; s++) {
+            float sa = float(s) / 6.0 * 6.28318 + seed;
+            vec2 sp = s == 6 ? vec2(0.0) : vec2(cos(sa), sin(sa)) * 0.09;
+            seeds += 1.0 - smoothstep(0.012, 0.022, length(p - sp));
+          }
+          float podRim = exp(-sq((r - 0.17) / 0.015));
+          cover = max(cover, pod);
+          rose *= 1.0 - pod;
+          jade += pod * 0.55;
+          ink += pod * (seeds * 0.4 + 0.05) + podRim * 0.22;
+          jade += pod * 0.0;
+        } else {
+          // a single petal adrift
+          vec2 q = vec2(p.x * 0.5 + 0.5, p.y);
+          q.y += 0.12 * (q.x - 0.5) * (q.x - 0.5) * 4.0 - 0.06;
+          float edge, tip;
+          float m = petal(q, 0.34, en, edge, tip);
+          cover = m;
+          rose = m * (0.22 + 0.5 * pow(clamp(tip, 0.0, 1.0), 1.5));
+          ink = edge * 0.32 * smoothstep(0.3, 0.6, vnoise(vec2(tip * 4.0, seed)));
+        }
+        o = vec4(cover, ink, jade, rose);
+      }
+    `;
+
+    /* Wet paper. rgb = pigment the koi have let go into the water (absorbance),
+       a = how wet the sheet is. Water wicks outward and the sheet slowly dries. */
+    const FS_WET = HEAD + `
+      in vec2 vUv;
+      out vec4 fragColor;
+      uniform sampler2D uPrev;
+      uniform sampler2D uFish0;
+      uniform sampler2D uFish1;
+      uniform vec2 uTexel;
+      uniform vec2 uRes;
+      uniform float uDt;
+      uniform float uTime;
+      uniform float uEnc;
+      uniform float uEncW;
+      uniform float uDither;
+      uniform float uWetRate;
+      uniform float uDryTime;
+      uniform vec4 uDrop[6];
+      uniform int uDropN;
+      uniform vec4 uRip[10];
+      uniform int uRipN;
+      float hash21(vec2 p) {
+        p = fract(p * vec2(127.1, 311.7));
+        p += dot(p, p + 34.23);
+        return fract(p.x * p.y);
+      }
+      float vnoise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(mix(hash21(i), hash21(i + vec2(1.0, 0.0)), u.x),
+                   mix(hash21(i + vec2(0.0, 1.0)), hash21(i + vec2(1.0, 1.0)), u.x), u.y);
+      }
+      vec4 dec(vec4 c) { return vec4(c.rgb / uEncW, c.a); }
+      float sq(float x) { return x * x; }
+      void main() {
+        vec2 px = vec2(vUv.x, 1.0 - vUv.y) * uRes;
+        vec4 c = dec(texture(uPrev, vUv));
+        vec4 nb = 0.25 * (dec(texture(uPrev, vUv + vec2(uTexel.x, 0.0))) + dec(texture(uPrev, vUv - vec2(uTexel.x, 0.0)))
+                        + dec(texture(uPrev, vUv + vec2(0.0, uTexel.y))) + dec(texture(uPrev, vUv - vec2(0.0, uTexel.y))));
+        // capillary spread: water wicks into its neighbours, the pigment rides along
+        float k = (1.0 - exp(-uDt * 3.0)) * (0.6 + 0.8 * vnoise(px * 0.03));
+        vec4 m = mix(c, nb, clamp(k, 0.0, 1.0));
+        float a = m.a;
+
+        vec4 f0 = texture(uFish0, vUv) / uEnc;
+        float cov = clamp(texture(uFish1, vUv).g / uEnc, 0.0, 1.0);
+        a += cov * uDt * uWetRate;
+
+        for (int i = 0; i < 6; i++) {
+          if (i >= uDropN) break;
+          vec4 D = uDrop[i];
+          float dd = length(px - D.xy) + (vnoise(px * 0.05 + float(i) * 7.0) - 0.5) * D.z * 0.5;
+          a += (1.0 - smoothstep(D.z * 0.55, D.z, dd)) * D.w;
+        }
+        for (int i = 0; i < 10; i++) {
+          if (i >= uRipN) break;
+          vec4 R = uRip[i];
+          float dd = length(px - R.xy);
+          float w = 6.0 + R.z * 0.05;
+          a += exp(-sq((dd - R.z) / w)) * R.w * uDt * 0.9;
+        }
+
+        a -= uDt / uDryTime;
+        vec3 T = m.rgb;
+        // pigment lifts off a soaked koi into the water around it
+        T += f0.rgb * cov * uDt * 0.1 * smoothstep(0.35, 0.8, a);
+        // ...and fades, faster once the paper has dried
+        T -= T * uDt * (0.04 + 0.4 * (1.0 - smoothstep(0.1, 0.45, a)));
+        float dn = (hash21(px + fract(uTime * 13.7) * 91.0) - 0.5) * uDither;
+        fragColor = vec4(clamp(T + dn * 1.5, 0.0, 4.0) * uEncW, clamp(a + dn, 0.0, 1.0));
+      }
+    `;
+
+    /* The pigment layer, at 1x: the koi as sumi where the sheet is dry and as
+       bleeding watercolour where it is wet, then leaves, then ink ripples.
+       Output is how much light the pigment lets through (relative to the paper). */
+    const FS_COMPOSE = HEAD + `
+      in vec2 vUv;
+      out vec4 fragColor;
+      uniform sampler2D uFish0;
+      uniform sampler2D uFish1;
+      uniform sampler2D uWet;
+      uniform sampler2D uLeaf;
+      uniform sampler2D uNoise;
+      uniform vec2 uRes;
+      uniform float uTime;
+      uniform float uEnc;
+      uniform float uEncW;
+      uniform vec4 uRip[10];
+      uniform float uRipSeed[10];
+      uniform int uRipN;
+      uniform int uDbg;
+      uniform vec4 uCard;      // x, y, w, h in page px
+      uniform float uCardR;
+      float cardSd(vec2 px) {
+        vec2 c = uCard.xy + uCard.zw * 0.5;
+        vec2 q = abs(px - c) - uCard.zw * 0.5 + uCardR;
+        return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - uCardR;
+      }
+      ${GLSL_PAPER}
+      // cubic B-spline upsampling from 4 bilinear taps, so the coarse wet map has no blocks
+      vec4 texSmooth(sampler2D t, vec2 uv) {
+        vec2 sz = vec2(textureSize(t, 0));
+        vec2 p = uv * sz - 0.5;
+        vec2 i = floor(p);
+        vec2 f = p - i;
+        vec2 w0 = (1.0 - f) * (1.0 - f) * (1.0 - f) / 6.0;
+        vec2 w1 = (4.0 - 6.0 * f * f + 3.0 * f * f * f) / 6.0;
+        vec2 w2 = (1.0 + 3.0 * f + 3.0 * f * f - 3.0 * f * f * f) / 6.0;
+        vec2 w3 = f * f * f / 6.0;
+        vec2 g0 = w0 + w1;
+        vec2 g1 = w2 + w3;
+        vec2 h0 = (i - 1.0 + w1 / g0 + 0.5) / sz;
+        vec2 h1 = (i + 1.0 + w3 / g1 + 0.5) / sz;
+        return g0.y * (g0.x * texture(t, h0) + g1.x * texture(t, vec2(h1.x, h0.y)))
+             + g1.y * (g0.x * texture(t, vec2(h0.x, h1.y)) + g1.x * texture(t, h1));
+      }
+      void main() {
+        vec2 px = vec2(vUv.x, 1.0 - vUv.y) * uRes;
+        vec3 paper = vec3(1.0);
+        float gran = 1.0; // granulation is applied per screen pixel in the final pass
+
+        // --- ripples: broken ink rings, and the water lens bending the koi below
+        vec2 disp = vec2(0.0);
+        float ring = 0.0;
+        for (int i = 0; i < 10; i++) {
+          if (i >= uRipN) break;
+          vec4 r = uRip[i];
+          vec2 dv = px - r.xy;
+          float d = length(dv);
+          float w = 2.0 + r.z * 0.026;
+          float k = (d - r.z) / w;
+          float k2 = (d - r.z * 0.62) / (w * 0.8);
+          if (abs(k) > 7.0 && abs(k2) > 7.0) continue;
+          float ang = atan(dv.y, dv.x);
+          float sd = uRipSeed[i];
+          float brk = smoothstep(0.22, 0.72, vnoise(vec2(ang * 4.0 + sd, r.z * 0.012 + sd)));
+          float brk2 = smoothstep(0.3, 0.75, vnoise(vec2(ang * 3.0 - sd, r.z * 0.01 + 4.0)));
+          float hair = 0.7 + 0.6 * vnoise(vec2(ang * 70.0 + sd, d * 0.06));
+          float g = exp(-k * k);
+          float g2 = exp(-k2 * k2);
+          ring += r.w * (g * (0.15 + 0.85 * brk) + g2 * 0.5 * brk2) * hair;
+          disp += dv / max(d, 1.0) * (-k * g) * r.w * 4.5;
+        }
+        vec2 fuv = vUv + vec2(disp.x, -disp.y) / uRes;
+
+        // --- how wet the sheet is here (ragged, like the dragon page)
+        vec4 wS = texSmooth(uWet, vUv);
+        wS.rgb /= uEncW;
+        vec4 NZ = texture(uNoise, vUv);
+        float n1 = NZ.r;
+        float n2 = NZ.g;
+        float n3 = NZ.b;
+        float wetN = wS.a + (n1 - 0.5) * 0.42 + (n2 - 0.5) * 0.18;
+        float wet = smoothstep(0.32, 0.62, wetN);
+
+        vec4 f0 = texture(uFish0, fuv) / uEnc;
+        vec4 f1 = texture(uFish1, fuv) / uEnc;
+        vec4 w0 = vec4(0.0);
+        vec4 w1 = vec4(0.0);
+        float tight = 0.0;
+        if (f1.g > 0.002 || wet > 0.01) {
+          // wide taps: how far the pigment can run in the wet sheet
+          float rad = 3.5 + 11.0 * wet;
+          float rot = n3 * 6.28318;
+          for (int t = 0; t < 8; t++) {
+            float an = float(t) * 0.7854 + rot;
+            float rr = rad * (0.55 + 0.45 * fract(float(t) * 0.618 + n1));
+            vec2 o = vec2(cos(an), sin(an)) * rr;
+            vec2 ouv = fuv + vec2(o.x, -o.y) / uRes;
+            w0 += texture(uFish0, ouv);
+            w1 += texture(uFish1, ouv);
+          }
+          w0 /= 8.0 * uEnc;
+          w1 /= 8.0 * uEnc;
+          for (int t = 0; t < 4; t++) {
+            float an = float(t) * 1.5708 + 0.4;
+            tight += texture(uFish1, fuv + vec2(cos(an), -sin(an)) * 1.8 / uRes).g;
+          }
+          tight /= 4.0 * uEnc;
+        }
+        float cov = clamp(f1.g, 0.0, 1.0);
+        float wideCov = clamp(w1.g, 0.0, 1.0);
+        vec3 sumiA = absorb(vec3(0.17, 0.165, 0.19));
+
+        // --- dry: translucent sumi with a darker tide line at the brush edge
+        float rim = clamp(cov - tight * 0.92, 0.0, 1.0);
+        float feather = smoothstep(0.1, 0.45, wideCov + (n3 - 0.5) * 0.3) * (1.0 - cov) * 0.09;
+        float dInk = f0.a + f1.r * (0.74 + 0.4 * n2) + rim * 0.9 * clamp(f1.r * 2.5, 0.0, 1.0) + feather;
+        vec3 inked = paper * exp(-sumiA * dInk * gran);
+        vec3 col = inked;
+
+        // --- wet: the ink blooms into the koi's colours and runs past its edges
+        if (wet > 0.001) {
+          float gate = smoothstep(0.45, 0.75, vnoise(px * 0.018 + 5.0));
+          float thr = mix(0.62, 0.12, gate);
+          float cauli = (NZ.a - 0.5) * 0.16 + (n3 - 0.5) * 0.1;
+          float bf = wideCov * 1.3 + cauli;
+          float spread = smoothstep(thr, thr + 0.025, bf) * (1.0 - cov);
+          float pool = exp(-sq((bf - thr - 0.012) / 0.016)) * gate * (1.0 - cov);
+          vec3 Aw = w0.rgb / max(wideCov, 0.06);
+          vec3 tot = f0.rgb * (0.66 + 0.34 * n2) * 1.2
+            + Aw * (spread * (0.1 + 0.16 * n2) + pool * 0.26 + rim * 0.35)
+            + sumiA * (f0.a * 0.9 + w0.a * spread * 0.12 + rim * cov * 0.16);
+          vec3 coloured = paper * exp(-tot * gran);
+          col = mix(inked, coloured, wet);
+        }
+
+        // --- wet paper is a shade darker, so laid water shows even before pigment reaches it
+        col *= 1.0 - smoothstep(0.3, 0.75, wetN) * (0.016 + 0.014 * n2) * (1.0 - cov);
+
+        // --- pigment let go into the water: colour while wet, grey ink as it dries
+        vec3 T = max(wS.rgb, 0.0);
+        float tg = (T.r + T.g + T.b) / 3.0;
+        col *= exp(-(T * wet * 0.8 + sumiA * tg * 0.4 * (1.0 - wet)) * gran);
+        float tide = exp(-sq((wetN - 0.5) / 0.07)) * (1.0 - cov) * smoothstep(0.4, 0.7, vnoise(px * 0.02 + 2.0));
+        col *= exp(-(sumiA * 0.018 + T * 0.6) * tide * gran);
+
+        // --- lotus leaves float on top; the koi pass beneath them
+        vec4 lf = texture(uLeaf, vUv);
+        float lc = clamp(lf.r, 0.0, 1.0);
+        col = mix(col, paper, lc * 0.8);
+        vec3 jadeA = absorb(vec3(0.42, 0.6, 0.5));
+        vec3 roseA = absorb(vec3(0.93, 0.6, 0.66));
+        col *= exp(-(sumiA * lf.g + jadeA * lf.b + roseA * lf.a) * gran);
+
+        // --- ink rings on the water
+        ring *= 1.0 - lc;
+        col *= exp(-sumiA * ring * 0.5 * gran);
+
+        // --- the card: a deckle-edged sheet laid on the pond, casting a soft shadow
+        float cardM = 0.0;
+        if (uCard.z > 1.0) {
+          float deckle = (vnoise(px * 0.38 + 3.0) - 0.5) * 1.6 + (vnoise(px * 0.07 + 9.0) - 0.5) * 2.4;
+          float sd = cardSd(px) + deckle;
+          cardM = 1.0 - smoothstep(-0.7, 0.7, sd);
+          float sdS = cardSd(px - vec2(4.0, 7.0)) + deckle * 0.5;
+          float shadow = (1.0 - smoothstep(-8.0, 22.0, sdS)) * (1.0 - cardM);
+          float contact = (1.0 - smoothstep(-1.0, 3.5, sdS)) * (1.0 - cardM);
+          col *= 1.0 - (shadow * 0.075 + contact * 0.05) * vec3(1.0, 1.02, 1.06);
+          float edge = exp(-sq(sd / 0.9)) * 0.07;
+          col *= 1.0 - edge;
+          col = mix(col, vec3(1.0), cardM);
+        }
+
+        if (uDbg == 1) col = vec3(1.0 - f0.a);
+        fragColor = vec4(col, cardM);
+        if (uDbg == 0) return;
+        if (uDbg == 2) col = vec3(1.0 - f1.r);
+        if (uDbg == 3) col = 1.0 - f0.rgb * 0.5;
+        if (uDbg == 4) col = f1.g > 1.02 ? vec3(1.0, 0.0, 0.0) : vec3(1.0 - f1.g * 0.6);
+        if (uDbg == 5) col = vec3(fract(f1.b * 10.0));
+        fragColor = vec4(col, 1.0);
+      }
+    `;
+
+    // Final pass at screen resolution: the pigment settles into the paper's tooth
+    const FS_FINAL = HEAD + `
+      in vec2 vUv;
+      out vec4 fragColor;
+      uniform sampler2D uPaper;
+      uniform sampler2D uPig;
+      void main() {
+        vec4 P = texture(uPaper, vUv);
+        float valley = 1.0 - smoothstep(0.25, 0.75, P.a);
+        float gran = 0.88 + 0.26 * valley; // < 1 on hilltops, > 1 in hollows
+        vec4 pg = texture(uPig, vUv);
+        vec3 tr = max(pg.rgb, vec3(0.002));
+        vec3 col = P.rgb * pow(tr, vec3(gran));
+        // the card sheet is a touch brighter and smoother than the pond paper
+        col = mix(col, mix(col, vec3(0.985, 0.978, 0.962), 0.35) * 1.01, pg.a);
+        fragColor = vec4(col, 1.0);
+      }
+    `;
+
+    /* =====================================================================
+       KOI
+       ===================================================================== */
+    const N_SPINE = 34;
+    const FLOATS_PER_VERT = 12;
+
+    function bodyWjs(u, W) {
+      if (u < 0.3) return W * Math.sqrt(clamp(1 - Math.pow((0.3 - u) / 0.31, 2), 0, 1));
+      return W * (1 - 0.8 * smoothstep(0.3, 0.82, u));
+    }
+
+    class Koi {
+      constructor(rng, i, pond) {
+        const md = Math.min(pond.width, pond.height);
+        this.seed = rng() * 10 + i;
+        this.type = [0, 4, 1, 3, 2, 5, 0, 6, 1, 3, 0][i % 11];
+        this.bfly = rng() < 0.3 ? 1 : 0;
+        this.L = clamp(md * (0.17 + rng() * 0.08), 82, 250);
+        this.W = 0.115 + rng() * 0.02;
+        this.depth = rng() * 0.55;
+        this.curious = rng();
+        this.orbitDir = rng() < 0.5 ? -1 : 1;
+        this.cruise = this.L * (0.26 + rng() * 0.1);
+        this.x = pond.width * (0.2 + rng() * 0.6);
+        this.y = pond.height * (0.2 + rng() * 0.6);
+        this.h = rng() * Math.PI * 2;
+        this.v = this.cruise;
+        this.turn = 0;
+        this.phase = rng() * 10;
+        this.finPhase = rng() * 10;
+        this.amp = 0.6;
+        this.fear = 0;
+        this.fleeX = 0;
+        this.fleeY = 0;
+        this.shy = 0;
+        this.hungry = false;
+        this.nibble = rng() * 2;
+        this.flapL = 0.3;
+        this.flapR = 0.3;
+        this.tailEnd = this.bfly ? 1.3 : 1.0;
+        this.finLen = this.bfly ? 0.33 : 0.2;
+        this.trail = [];
+        const dx = Math.cos(this.h), dy = Math.sin(this.h);
+        for (let s = 3; s < this.L * 1.5; s += 3) this.trail.push([this.x - dx * s, this.y - dy * s]);
+        this.us = new Float32Array(N_SPINE);
+        for (let k = 0; k < N_SPINE; k++) this.us[k] = -0.04 + (this.tailEnd + 0.08) * k / (N_SPINE - 1);
+        this.ext = new Float32Array(N_SPINE);
+        for (let k = 0; k < N_SPINE; k++) this.ext[k] = this._extent(this.us[k]) * this.L;
+        this.bx = new Float32Array(N_SPINE);
+        this.by = new Float32Array(N_SPINE);
+        this.sx = new Float32Array(N_SPINE);
+        this.sy = new Float32Array(N_SPINE);
+        this.midX = this.x;
+        this.midY = this.y;
+      }
+
+      // how far the strip must reach sideways at u to hold body, fins and tail (in L)
+      _extent(u) {
+        const W = this.W;
+        let e = bodyWjs(u, W) * 1.3 + 0.015;
+        const fl = this.finLen;
+        if (u > 0.08 && u < 0.24 + fl * 1.1 + 0.04) e = Math.max(e, bodyWjs(0.24, W) * 0.8 + fl * 1.05 + 0.03);
+        const pfl = this.bfly ? 0.16 : 0.09;
+        if (u > 0.44 && u < 0.52 + pfl * 1.1 + 0.04) e = Math.max(e, bodyWjs(0.52, W) * 0.8 + pfl * 1.05 + 0.03);
+        if (u > 0.72) {
+          const tl = clamp((u + 0.04 - 0.78) / (this.tailEnd - 0.78), 0, 1);
+          e = Math.max(e, W * (0.22 + 1.55 * Math.pow(tl, 0.75)) * (this.bfly ? 1.35 : 1) * 1.15 + 0.03);
+        }
+        return e;
+      }
+
+      // points along the path the head has swum, at arc distances dists[] (ascending)
+      _sampleTrail(dists, outX, outY) {
+        const tr = this.trail;
+        let ax = this.x, ay = this.y, acc = 0, j = 0;
+        let bx = tr[0][0], by = tr[0][1];
+        let seg = Math.hypot(bx - ax, by - ay);
+        const hx = Math.cos(this.h), hy = Math.sin(this.h);
+        for (let k = 0; k < dists.length; k++) {
+          const s = dists[k];
+          if (s <= 0) {
+            outX[k] = this.x - hx * s;
+            outY[k] = this.y - hy * s;
+            continue;
+          }
+          while (acc + seg < s && j < tr.length - 1) {
+            acc += seg;
+            ax = bx; ay = by;
+            j++;
+            bx = tr[j][0]; by = tr[j][1];
+            seg = Math.hypot(bx - ax, by - ay);
+          }
+          const t = seg > 1e-4 ? (s - acc) / seg : 0;
+          outX[k] = ax + (bx - ax) * t;
+          outY[k] = ay + (by - ay) * t;
+        }
+      }
+
+      buildSpine() {
+        const N = N_SPINE, L = this.L, us = this.us;
+        if (!this._d) this._d = new Float32Array(N);
+        for (let k = 0; k < N; k++) this._d[k] = us[k] * L;
+        this._sampleTrail(this._d, this.bx, this.by);
+        // body wave: grows toward the tail, the head recoils a little
+        for (let k = 0; k < N; k++) {
+          const u = us[k];
+          const k0 = Math.max(0, k - 1), k1 = Math.min(N - 1, k + 1);
+          let tx = this.bx[k0] - this.bx[k1], ty = this.by[k0] - this.by[k1];
+          const tl = Math.hypot(tx, ty) || 1;
+          tx /= tl; ty /= tl;
+          const uu = Math.max(0, u);
+          const env = 0.1 + 0.9 * Math.pow(uu, 1.7);
+          const lat = this.amp * 0.055 * L * env * Math.sin(this.phase - uu * 4.6);
+          this.sx[k] = this.bx[k] - ty * lat;
+          this.sy[k] = this.by[k] + tx * lat;
+        }
+        // relax the path so its polyline corners never kink the strip
+        if (!this._tx) { this._tx = new Float32Array(N); this._ty = new Float32Array(N); }
+        for (let pass = 0; pass < 3; pass++) {
+          const tx = this._tx, ty = this._ty;
+          tx.set(this.sx); ty.set(this.sy);
+          for (let k = 2; k < N - 1; k++) {
+            this.sx[k] = (tx[k - 1] + 2 * tx[k] + tx[k + 1]) * 0.25;
+            this.sy[k] = (ty[k - 1] + 2 * ty[k] + ty[k + 1]) * 0.25;
+          }
+        }
+        const m = Math.round(N * 0.45);
+        this.midX = this.sx[m];
+        this.midY = this.sy[m];
+      }
+
+      writeVerts(buf, off) {
+        const N = N_SPINE;
+        const p0 = [this.seed, this.type, this.L, this.W];
+        const p1 = [this.flapL, this.flapR, this.depth, this.bfly];
+        const step = (this.us[1] - this.us[0]) * this.L;
+        if (!this._prev) this._prev = new Float32Array(4);
+        const prev = this._prev;
+        for (let k = 0; k < N; k++) {
+          const k0 = Math.max(0, k - 2), k1 = Math.min(N - 1, k + 2);
+          let tx = this.sx[k0] - this.sx[k1], ty = this.sy[k0] - this.sy[k1];
+          const tl = Math.hypot(tx, ty) || 1;
+          tx /= tl; ty /= tl;
+          const nx = -ty, ny = tx;
+          const e = this.ext[k];
+          for (let side = -1; side <= 1; side += 2) {
+            let vx = this.sx[k] + nx * e * side;
+            let vy = this.sy[k] + ny * e * side;
+            // never let a strip edge step backwards: that folds triangles over each other
+            const si = side < 0 ? 0 : 2;
+            if (k > 0) {
+              const pr = (vx - prev[si]) * -tx + (vy - prev[si + 1]) * -ty;
+              const minStep = step * 0.25;
+              if (pr < minStep) { vx -= tx * (minStep - pr); vy -= ty * (minStep - pr); }
+            }
+            prev[si] = vx; prev[si + 1] = vy;
+            buf[off++] = vx;
+            buf[off++] = vy;
+            buf[off++] = this.us[k];
+            buf[off++] = e * side;
+            buf[off++] = p0[0]; buf[off++] = p0[1]; buf[off++] = p0[2]; buf[off++] = p0[3];
+            buf[off++] = p1[0]; buf[off++] = p1[1]; buf[off++] = p1[2]; buf[off++] = p1[3];
+          }
+        }
+        return off;
+      }
+    }
+
+    /* =====================================================================
+       THE POND
+       ===================================================================== */
+    class KoiPond extends HTMLElement {
+      static get observedAttributes() { return ['closing']; }
+
+      constructor() {
+        super();
+        this.attachShadow({ mode: 'open' });
+        this.params = new URLSearchParams(location.search);
+        this.testMode = this.params.has('test');
+        this.seed = +(this.params.get('seed') || 0) || ((Math.random() * 1e9) | 0);
+        this.pointer = { x: 0, y: 0, active: false, lastMove: -99, speed: 0, lastT: 0, down: false };
+        this.ripples = [];
+        this.drops = [];
+        this.food = null;
+        this.time = 0;
+        this.lastScare = -9;
+        this.nextKiss = 6;
+      }
+
+      connectedCallback() {
+        this._buildDOM();
+        this._initGL();
+        this._resize(true);
+        this._bindEvents();
+        window.__koi = this._testApi();
+        if (!this.testMode) {
+          this._last = performance.now();
+          const loop = (now) => {
+            const dt = Math.min(0.05, Math.max(0.001, (now - this._last) / 1000));
+            this._last = now;
+            this.step(dt);
+            this.raf = requestAnimationFrame(loop);
+          };
+          this.raf = requestAnimationFrame(loop);
+        }
+        window.__ready = true;
+      }
+
+      disconnectedCallback() {
+        cancelAnimationFrame(this.raf);
+        if (this.ro) this.ro.disconnect();
+      }
+
+      _buildDOM() {
+        const ink = '#1e1913';
+        this.shadowRoot.innerHTML = `
+          <style>
+            :host { display: block; position: relative; width: 100%; height: 100%; overflow: hidden; }
+            canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+            .card {
+              position: absolute;
+              left: 50%; top: 50%;
+              width: min(352px, calc(100% - 32px));
+              transform: translate(-50%, -50%);
+              padding: 34px 34px 26px;
+              color: ${ink};
+              touch-action: manipulation;
+              -webkit-user-select: text; user-select: text;
+              font-family: "EB Garamond", Georgia, "Times New Roman", serif;
+            }
+            .view { transition: opacity 0.45s ease; }
+            [hidden] { display: none !important; }
+            .view.fade { opacity: 0; }
+            .seal {
+              width: 30px; height: 30px;
+              display: grid; place-items: center;
+              background: #b8453a;
+              color: #fbf5ec;
+              border-radius: 3px;
+              font: 400 19px/1 "STKaiti", "Kaiti SC", "KaiTi", "Songti SC", serif;
+              transform: rotate(-3deg);
+              box-shadow: inset 0 0 0 1.5px rgba(251, 245, 236, 0.35);
+              margin-bottom: 20px;
+              opacity: 0.92;
+            }
+            h1 { font-weight: 400; font-size: 31px; line-height: 1.05; letter-spacing: -0.01em; margin-bottom: 6px; }
+            .sub { font-style: italic; font-size: 16px; color: ${PALETTE.labelInk}; margin-bottom: 24px; }
+            label {
+              display: block;
+              font: 400 10.5px/1 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+              letter-spacing: 0.14em;
+              text-transform: uppercase;
+              color: ${PALETTE.labelInk};
+              margin-bottom: 18px;
+            }
+            input {
+              display: block;
+              width: 100%;
+              margin-top: 7px;
+              padding: 6px 0 8px;
+              border: 0;
+              border-bottom: 1px solid rgba(30, 25, 19, 0.26);
+              border-radius: 0;
+              background: transparent;
+              color: ${ink};
+              font: 400 18px/1.2 "EB Garamond", Georgia, serif;
+              letter-spacing: 0.01em;
+              outline: none;
+              transition: border-color 0.25s ease, box-shadow 0.25s ease;
+            }
+            input:focus { border-bottom-color: ${ink}; box-shadow: 0 1px 0 ${ink}; }
+            input::placeholder { color: rgba(107, 100, 91, 0.55); font-style: italic; }
+            .err {
+              min-height: 20px;
+              margin: -6px 0 10px;
+              font-style: italic; font-size: 15px;
+              color: #b8453a;
+            }
+            button {
+              display: block;
+              width: 100%;
+              height: 46px;
+              border: 0;
+              border-radius: 3px;
+              background: #1f1c19;
+              color: #f8f6f1;
+              font: 400 11.5px/1 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+              letter-spacing: 0.18em;
+              text-transform: uppercase;
+              cursor: pointer;
+              transition: background 0.2s ease, transform 0.1s ease, opacity 0.2s ease;
+            }
+            button:hover { background: #2e2925; }
+            button:active { transform: scale(0.99); }
+            button:disabled { opacity: 0.7; cursor: default; }
+            button:focus-visible { outline: 1.5px solid #b8453a; outline-offset: 3px; }
+            button.ghost { background: transparent; color: ${ink}; box-shadow: inset 0 0 0 1px rgba(30, 25, 19, 0.35); }
+            button.ghost:hover { background: rgba(30, 25, 19, 0.05); }
+            .row { display: flex; justify-content: space-between; gap: 12px; margin-top: 16px; }
+            a { color: ${PALETTE.labelInk}; font-style: italic; font-size: 15px; text-decoration: none; }
+            a:hover { color: ${ink}; text-decoration: underline; text-underline-offset: 3px; }
+            .demo {
+              margin-top: 20px;
+              padding-top: 14px;
+              border-top: 1px solid rgba(30, 25, 19, 0.1);
+              font: 400 10px/1.5 "JetBrains Mono", ui-monospace, monospace;
+              letter-spacing: 0.04em;
+              color: rgba(107, 100, 91, 0.85);
+            }
+            .bar { position: relative; height: 7px; margin: 8px 0 12px; }
+            .bar::before { content: ""; position: absolute; left: 0; right: 0; top: 3px; height: 1px; background: rgba(30, 25, 19, 0.16); }
+            .fill {
+              position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+              background: ${ink};
+              border-radius: 4px 2px 3px 1px / 3px 4px 2px 4px;
+              opacity: 0.88;
+              -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 14px), rgba(0,0,0,0.35));
+                      mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 14px), rgba(0,0,0,0.35));
+            }
+            .pct { font: 400 10.5px/1 "JetBrains Mono", ui-monospace, monospace; letter-spacing: 0.12em; color: ${PALETTE.labelInk}; }
+            .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+            @media (max-width: 400px) { .card { padding: 28px 24px 22px; } h1 { font-size: 28px; } }
+          </style>
+          <canvas id="c" aria-hidden="true"></canvas>
+          <div class="card" id="card">
+            <form class="view" id="v-form" novalidate>
+              <div class="seal" aria-hidden="true">鯉</div>
+              <h1>Bon retour</h1>
+              <p class="sub">Connectez-vous pour retrouver l'étang.</p>
+              <label>Email<input id="email" type="email" autocomplete="email" inputmode="email" placeholder="vous@exemple.com" required /></label>
+              <label>Mot de passe<input id="pw" type="password" autocomplete="current-password" placeholder="••••••••" required /></label>
+              <p class="err" id="err" role="alert" aria-live="assertive"></p>
+              <button type="submit" id="go">Se connecter</button>
+              <div class="row"><a href="#" id="forgot">Mot de passe oublié ?</a><a href="#" id="signup">Créer un compte</a></div>
+              <p class="demo">Démo — n'importe quel email, mot de passe de 6 caractères ou plus.</p>
+            </form>
+            <div class="view" id="v-load" hidden aria-live="polite">
+              <div class="seal" aria-hidden="true">鯉</div>
+              <h1 id="l-title">Un instant…</h1>
+              <p class="sub" id="l-sub">Les koi préparent l'étang.</p>
+              <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" id="bar"><div class="fill" id="fill"></div></div>
+              <div class="pct" id="pct">0 %</div>
+              <button type="button" class="ghost" id="out" hidden style="margin-top:22px">Se déconnecter</button>
+            </div>
+          </div>
+        `;
+        const $ = (id) => this.shadowRoot.getElementById(id);
+        this.canvas = $('c');
+        this.cardEl = $('card');
+        this.ui = {
+          form: $('v-form'), load: $('v-load'), email: $('email'), pw: $('pw'), err: $('err'), go: $('go'),
+          title: $('l-title'), sub: $('l-sub'), fill: $('fill'), bar: $('bar'), pct: $('pct'), out: $('out')
+        };
+        this.mode = 'form';
+        this.focused = false;
+        this.shakeT = -9;
+        this._bindCard();
+      }
+
+      attributeChangedCallback() {}
+
+      /* ------------------------------------------------------------ THE CARD */
+      _bindCard() {
+        const U = this.ui;
+        const onFocus = () => { this.focused = true; this._edgeRipple(0.55, 0.6); };
+        const onBlur = () => { this.focused = false; };
+        for (const el of [U.email, U.pw]) {
+          el.addEventListener('focus', onFocus);
+          el.addEventListener('blur', onBlur);
+          el.addEventListener('input', () => {
+            if (U.err.textContent) U.err.textContent = '';
+            const now = performance.now();
+            if (now - (this._lastKey || 0) < 70) return;
+            this._lastKey = now;
+            // each keystroke lets a drop fall beside the card, at the height of the field
+            const c = this.card;
+            if (!c) return;
+            const r = el.getBoundingClientRect(), h = this.getBoundingClientRect();
+            const fy = (r.top + r.height * 0.5 - h.top - c.y) / c.h;
+            this._edgeRipple(clamp(fy + (Math.random() - 0.5) * 0.1, 0.05, 0.95), 0.3, Math.random() < 0.5 ? -1 : 1);
+          });
+        }
+        U.form.addEventListener('submit', (e) => { e.preventDefault(); this._submit(); });
+        for (const a of [this.shadowRoot.getElementById('forgot'), this.shadowRoot.getElementById('signup')]) {
+          a.addEventListener('click', (e) => { e.preventDefault(); this._edgeRipple(0.95, 0.5); });
+        }
+        U.out.addEventListener('click', () => this._reset());
+      }
+
+      // a ripple just outside the card's left/right edge at relative height fy
+      _edgeRipple(fy, str, side) {
+        const c = this.card;
+        if (!c) return;
+        const sd = side || (Math.random() < 0.5 ? -1 : 1);
+        const x = sd < 0 ? c.x - 14 - Math.random() * 10 : c.x + c.w + 14 + Math.random() * 10;
+        const y = c.y + c.h * fy;
+        this.addRipple(x, y, str, false);
+        this.drops.push([x, y, 26, 0.35]);
+      }
+
+      _submit() {
+        if (this.mode !== 'form') return;
+        const U = this.ui;
+        const email = U.email.value.trim();
+        const pw = U.pw.value;
+        U.go.disabled = true;
+        U.go.textContent = 'Vérification…';
+        this.mode = 'checking';
+        setTimeout(() => {
+          U.go.disabled = false;
+          U.go.textContent = 'Se connecter';
+          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || pw.length < 6) {
+            this.mode = 'form';
+            this._fail(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? 'Cet email ne semble pas valide.' : 'Email ou mot de passe incorrect.');
+          } else {
+            this._succeed(email);
+          }
+        }, 650);
+      }
+
+      // a wrong password: the card jolts, an ink ring spreads and the koi bolt
+      _fail(msg) {
+        this.ui.err.textContent = msg;
+        this.shakeT = this.time;
+        const c = this.card;
+        if (c) {
+          const cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+          this.addRipple(cx, cy, 1.1, true);
+          this.scare(cx, cy, true);
+        }
+        this.ui.pw.focus();
+      }
+
+      // the right password: the koi gather, the paper around the card soaks and blooms
+      _succeed(email) {
+        const U = this.ui;
+        this.mode = 'opening';
+        this.loadEmail = email;
+        this.dropS = 0;
+        const c = this.card;
+        if (c) this.addRipple(c.x + c.w / 2, c.y + c.h / 2, 0.9, true);
+        for (const f of this.fish) { f.fear = 0; f.shy = 0; f.hungry = false; }
+        U.form.classList.add('fade');
+        setTimeout(() => {
+          U.form.hidden = true;
+          U.load.hidden = false;
+          U.load.classList.add('fade');
+          U.title.textContent = 'Un instant…';
+          U.sub.textContent = "Les koi préparent l'étang.";
+          U.out.hidden = true;
+          U.bar.hidden = false; U.pct.hidden = false;
+          U.fill.style.width = '0%'; U.pct.textContent = '0 %';
+          this.mode = 'loading';
+          this.loadT = this.time;
+          this.dropS = 0;
+          requestAnimationFrame(() => U.load.classList.remove('fade'));
+        }, 420);
+      }
+
+      _updateCardFlow(dt) {
+        const U = this.ui;
+        const c = this.card;
+        if (this.mode === 'loading' && c) {
+          const D = 3.6;
+          const p = clamp((this.time - this.loadT - 0.3) / D, 0, 1);
+          const e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+          U.fill.style.width = (e * 100).toFixed(1) + '%';
+          U.pct.textContent = Math.round(e * 100) + ' %';
+          U.bar.setAttribute('aria-valuenow', Math.round(e * 100));
+          // progress is painted as water laid around the card, clockwise from the top
+          const per = 2 * (c.w + c.h);
+          const target = e * per;
+          while (this.dropS < target) {
+            const [x, y] = this._perimeterPoint(this.dropS, 22);
+            this.drops.push([x, y, 34, 0.75]);
+            this.dropS += 22;
+          }
+          if (p >= 1) {
+            this.mode = 'done';
+            this.addRipple(c.x + c.w / 2, c.y + c.h / 2, 1.2, true);
+            U.title.textContent = 'Bienvenue.';
+            U.sub.textContent = this.loadEmail;
+            U.bar.hidden = true; U.pct.hidden = true;
+            U.out.hidden = false;
+          }
+        }
+        if (this.drops.length > 6) this.drops.splice(0, this.drops.length - 6);
+        // fish that wandered under the card get out quickly
+        for (const f of this.fish) if (this.cardSd(f.x, f.y) < 0) f.v = Math.max(f.v, f.cruise * 1.4);
+      }
+
+      _perimeterPoint(s, off) {
+        const c = this.card;
+        const per = 2 * (c.w + c.h);
+        s = ((s % per) + per) % per;
+        const cx = c.x + c.w / 2;
+        // start at the top centre and run clockwise
+        let t = s + c.w / 2;
+        if (t < c.w) return [c.x + t, c.y - off];
+        t -= c.w;
+        if (t < c.h) return [c.x + c.w + off, c.y + t];
+        t -= c.h;
+        if (t < c.w) return [c.x + c.w - t, c.y + c.h + off];
+        t -= c.w;
+        if (t < c.h) return [c.x - off, c.y + c.h - t];
+        t -= c.h;
+        return [c.x + t, c.y - off];
+      }
+
+      _reset() {
+        const U = this.ui;
+        U.load.classList.add('fade');
+        setTimeout(() => {
+          U.load.hidden = true;
+          U.form.hidden = false;
+          U.form.classList.add('fade');
+          U.pw.value = '';
+          U.err.textContent = '';
+          this.mode = 'form';
+          requestAnimationFrame(() => U.form.classList.remove('fade'));
+        }, 420);
+      }
+
+      // where the card sits on the page (follows the CSS layout and the shake)
+      _measureCard() {
+        const el = this.cardEl;
+        const t = this.time - this.shakeT;
+        const shake = t < 0.6 ? Math.sin(t * 46) * 9 * Math.exp(-t * 6) : 0;
+        el.style.transform = `translate(calc(-50% + ${shake.toFixed(2)}px), -50%)`;
+        const r = el.getBoundingClientRect(), h = this.getBoundingClientRect();
+        this.card = { x: r.left - h.left, y: r.top - h.top, w: r.width, h: r.height, r: 6 };
+      }
+
+      cardSd(x, y) {
+        const c = this.card;
+        if (!c) return 1e9;
+        const qx = Math.abs(x - (c.x + c.w / 2)) - c.w / 2 + c.r;
+        const qy = Math.abs(y - (c.y + c.h / 2)) - c.h / 2 + c.r;
+        return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - c.r;
+      }
+
+      cardNormal(x, y) {
+        const e = 1.5;
+        const gx = this.cardSd(x + e, y) - this.cardSd(x - e, y);
+        const gy = this.cardSd(x, y + e) - this.cardSd(x, y - e);
+        const l = Math.hypot(gx, gy) || 1;
+        return [gx / l, gy / l];
+      }
+
+      /* ---------------------------------------------------------------- GL */
+      _initGL() {
+        const gl = this.canvas.getContext('webgl2', {
+          alpha: false, antialias: false, depth: false, stencil: false,
+          preserveDrawingBuffer: this.testMode, powerPreference: 'high-performance'
+        });
+        this.gl = gl;
+        if (!gl) return;
+
+        const compile = (type, src) => {
+          const sh = gl.createShader(type);
+          gl.shaderSource(sh, src);
+          gl.compileShader(sh);
+          if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+            console.error('Shader error:', gl.getShaderInfoLog(sh));
+            return null;
+          }
+          return sh;
+        };
+        const program = (vsSrc, fsSrc, attribs) => {
+          const p = gl.createProgram();
+          gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+          gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+          attribs.forEach((a, i) => gl.bindAttribLocation(p, i, a));
+          gl.linkProgram(p);
+          if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+            console.error('Link error:', gl.getProgramInfoLog(p));
+            return null;
+          }
+          const u = {};
+          const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+          for (let i = 0; i < n; i++) {
+            const info = gl.getActiveUniform(p, i);
+            const name = info.name.replace(/\[0\]$/, '');
+            u[name] = gl.getUniformLocation(p, info.name);
+          }
+          return { p, u };
+        };
+
+        this.progPaper = program(VS_FULL, FS_PAPER, ['aPos']);
+        this.progNoise = program(VS_FULL, FS_NOISE, ['aPos']);
+        this.progWet = program(VS_FULL, FS_WET, ['aPos']);
+        this.progCompose = program(VS_FULL, FS_COMPOSE, ['aPos']);
+        this.progFinal = program(VS_FULL, FS_FINAL, ['aPos']);
+        this.progFish = program(VS_STRIP, FS_FISH, ['aPos', 'aLoc', 'aP0', 'aP1']);
+        this.progLeaf = program(VS_STRIP, FS_LEAF, ['aPos', 'aLoc', 'aP0', 'aP1']);
+        if (!this.progPaper || !this.progWet || !this.progCompose || !this.progFish || !this.progLeaf) {
+          this.gl = null;
+          return;
+        }
+
+        // full-screen triangle strip
+        this.vaoQuad = gl.createVertexArray();
+        gl.bindVertexArray(this.vaoQuad);
+        const qb = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+        const stripVao = () => {
+          const vao = gl.createVertexArray();
+          gl.bindVertexArray(vao);
+          const b = gl.createBuffer();
+          gl.bindBuffer(gl.ARRAY_BUFFER, b);
+          const stride = FLOATS_PER_VERT * 4;
+          const sizes = [2, 2, 4, 4];
+          let off = 0;
+          sizes.forEach((s, i) => {
+            gl.enableVertexAttribArray(i);
+            gl.vertexAttribPointer(i, s, gl.FLOAT, false, stride, off);
+            off += s * 4;
+          });
+          return { vao, buf: b };
+        };
+        this.fishGeo = stripVao();
+        this.leafGeo = stripVao();
+        gl.bindVertexArray(null);
+
+        // half-float targets where the GPU allows it, 8-bit (scaled and dithered) elsewhere
+        this.halfOK = !this.params.has('lowp') && (!!gl.getExtension('EXT_color_buffer_float') || !!gl.getExtension('EXT_color_buffer_half_float'));
+        gl.getExtension('OES_texture_float_linear');
+        this.paperTex = this._tex(1, 1, false);
+      }
+
+      _tex(w, h, half, data = null) {
+        const gl = this.gl;
+        const t = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, t);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        if (half) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, data);
+        else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+        return t;
+      }
+
+      _target(w, h, count, half) {
+        const gl = this.gl;
+        const fb = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+        const tex = [];
+        for (let i = 0; i < count; i++) {
+          tex.push(this._tex(w, h, half));
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, tex[i], 0);
+        }
+        gl.drawBuffers(tex.map((_, i) => gl.COLOR_ATTACHMENT0 + i));
+        const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        if (!ok) {
+          tex.forEach(t => gl.deleteTexture(t));
+          gl.deleteFramebuffer(fb);
+          return null;
+        }
+        return { fb, tex, w, h };
+      }
+
+      _freeTarget(t) {
+        if (!t) return;
+        t.tex.forEach(x => this.gl.deleteTexture(x));
+        this.gl.deleteFramebuffer(t.fb);
+      }
+
+      _makeTargets() {
+        const gl = this.gl;
+        [this.fishT, this.leafT, this.wetA, this.wetB, this.pigT, this.noiseT].forEach(t => this._freeTarget(t));
+        const fw = Math.round(this.width * this.fishScale);
+        const fh = Math.round(this.height * this.fishScale);
+        let half = this.halfOK;
+        this.fishT = half ? this._target(fw, fh, 2, true) : null;
+        if (!this.fishT) { half = false; this.fishT = this._target(fw, fh, 2, false); }
+        this.enc = half ? 1 : 0.25;
+        this.leafT = this._target(fw, fh, 1, false);
+        this.pigT = this._target(fw, fh, 1, false);
+        this.noiseT = this._target(fw, fh, 1, false);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.noiseT.fb);
+        gl.viewport(0, 0, fw, fh);
+        gl.disable(gl.BLEND);
+        gl.useProgram(this.progNoise.p);
+        gl.uniform2f(this.progNoise.u.uRes, this.width, this.height);
+        gl.bindVertexArray(this.vaoQuad);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        const ww = Math.max(16, Math.round(this.width / 4));
+        const wh = Math.max(16, Math.round(this.height / 4));
+        let wHalf = this.halfOK;
+        this.wetA = wHalf ? this._target(ww, wh, 1, true) : null;
+        if (!this.wetA) { wHalf = false; this.wetA = this._target(ww, wh, 1, false); }
+        this.wetB = this._target(ww, wh, 1, wHalf);
+        this.encW = wHalf ? 1 : 0.5;
+        this.dither = wHalf ? 0 : 1 / 255;
+      }
+
+      /* ------------------------------------------------------------ RESIZE */
+      _resize(first) {
+        const rect = this.getBoundingClientRect();
+        const prevW = this.width || rect.width, prevH = this.height || rect.height;
+        this.width = Math.max(240, Math.round(rect.width || innerWidth));
+        this.height = Math.max(240, Math.round(rect.height || innerHeight));
+        this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const mobile = Math.min(this.width, this.height) < 600;
+        this.fishScale = mobile ? Math.min(1.5, this.dpr) : 1;
+        this.canvas.width = Math.round(this.width * this.dpr);
+        this.canvas.height = Math.round(this.height * this.dpr);
+        if (!this.gl) {
+          const ctx = this.canvas.getContext('2d');
+          if (ctx) ctx.drawImage(buildPaperCanvas(this.width, this.height, PALETTE, false), 0, 0, this.canvas.width, this.canvas.height);
+          return;
+        }
+        this._bakePaper();
+        this._makeTargets();
+        if (first || !this.fish) {
+          this._populate();
+        } else {
+          const sx = this.width / prevW, sy = this.height / prevH;
+          for (const f of this.fish) {
+            f.x *= sx; f.y *= sy;
+            for (const p of f.trail) { p[0] *= sx; p[1] *= sy; }
+          }
+          for (const l of this.leaves) { l.x *= sx; l.y *= sy; l.hx *= sx; l.hy *= sy; }
+        }
+      }
+
+      _bakePaper() {
+        const gl = this.gl;
+        const cvs = buildPaperCanvas(this.width, this.height, PALETTE, false, 7);
+        gl.deleteTexture(this.paperTex);
+        this.paperTex = this._tex(1, 1, false);
+        gl.bindTexture(gl.TEXTURE_2D, this.paperTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, cvs);
+        this._freeTarget(this.paperT);
+        this.paperT = this._target(this.canvas.width, this.canvas.height, 1, false);
+        const P = this.progPaper;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.paperT.fb);
+        gl.viewport(0, 0, this.paperT.w, this.paperT.h);
+        gl.disable(gl.BLEND);
+        gl.useProgram(P.p);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.paperTex);
+        gl.uniform1i(P.u.uPaperTex, 0);
+        gl.uniform2f(P.u.uRes, this.width, this.height);
+        gl.uniform1f(P.u.uIsDark, 0);
+        gl.uniform3fv(P.u.uPaperCol, hexToRgbNorm(PALETTE.paper));
+        gl.bindVertexArray(this.vaoQuad);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      }
+
+      _populate() {
+        const rng = mulberry32(this.seed);
+        const W = this.width, H = this.height;
+        const md = Math.min(W, H);
+        const count = Math.round(clamp((W * H) / 140000, 5, 10));
+        this.fish = [];
+        for (let i = 0; i < count; i++) this.fish.push(new Koi(rng, i, this));
+
+        // leaves gather toward the edges, like a pond seen from its bank
+        const base = clamp(md * 0.085, 34, 92);
+        const layout = W / H > 1
+          ? [[0.11, 0.2, 1.0], [0.21, 0.32, 0.6], [0.87, 0.17, 0.85], [0.82, 0.8, 1.05], [0.68, 0.9, 0.55], [0.08, 0.83, 0.72]]
+          : [[0.16, 0.12, 1.0], [0.84, 0.2, 0.8], [0.8, 0.84, 1.0], [0.18, 0.76, 0.7], [0.6, 0.06, 0.5]];
+        const flowers = W / H > 1 ? [[0.25, 0.18, 0.52], [0.9, 0.68, 0.46]] : [[0.3, 0.16, 0.5], [0.66, 0.86, 0.46]];
+        this.leaves = [];
+        const add = (type, x, y, r) => this.leaves.push({
+          type, x, y, hx: x, hy: y, vx: 0, vy: 0, r, rot: rng() * Math.PI * 2, vr: (rng() - 0.5) * 0.04,
+          seed: rng() * 40, bob: rng() * 6, kick: 0
+        });
+        for (const [x, y, s] of layout) add(0, x * W, y * H, base * s);
+        for (const [x, y, s] of flowers) add(1, x * W, y * H, base * s * 1.25);
+        const nPetals = W / H > 1 ? 6 : 4;
+        for (let i = 0; i < nPetals; i++) add(2, (0.15 + rng() * 0.7) * W, (0.15 + rng() * 0.7) * H, base * (0.16 + rng() * 0.06));
+        for (const l of this.leaves) if (l.type === 2) { l.vx = (rng() - 0.5) * 6; l.vy = (rng() - 0.5) * 6; }
+      }
+
+      /* ------------------------------------------------------------ EVENTS */
+      _bindEvents() {
+        this.ro = new ResizeObserver(() => {
+          clearTimeout(this._rt);
+          this._rt = setTimeout(() => this._resize(false), 120);
+        });
+        this.ro.observe(this);
+        const pos = (e) => {
+          const r = this.getBoundingClientRect();
+          return [e.clientX - r.left, e.clientY - r.top];
+        };
+        this.addEventListener('pointermove', (e) => {
+          const [x, y] = pos(e);
+          this._pointerMove(x, y, e.timeStamp / 1000, e.pointerType !== 'touch' || this.pointer.down);
+        });
+        this.addEventListener('pointerdown', (e) => {
+          if (e.composedPath().includes(this.cardEl)) return;
+          const [x, y] = pos(e);
+          this.pointer.down = true;
+          this.pointer.x = x; this.pointer.y = y;
+          this.pointer.lastT = e.timeStamp / 1000;
+          this.pointer.speed = 0;
+          this.pointer.active = true;
+          this.pointer.lastMove = this.time;
+          this.tap(x, y);
+        });
+        const up = (e) => {
+          this.pointer.down = false;
+          if (e.pointerType === 'touch') this.pointer.active = false;
+        };
+        this.addEventListener('pointerup', up);
+        this.addEventListener('pointercancel', up);
+        this.addEventListener('pointerleave', () => { this.pointer.active = false; this.pointer.down = false; });
+      }
+
+      _pointerMove(x, y, ts, present) {
+        const P = this.pointer;
+        const dt = Math.max(0.004, ts - P.lastT);
+        const d = Math.hypot(x - P.x, y - P.y);
+        const inst = P.active ? d / dt : 0;
+        P.speed = lerp(P.speed, inst, dt > 0.1 ? 1 : 0.5);
+        P.vx = (x - P.x) / dt; P.vy = (y - P.y) / dt;
+        P.x = x; P.y = y; P.lastT = ts;
+        P.active = present;
+        P.lastMove = this.time;
+        const md = Math.min(this.width, this.height);
+        if (P.speed > Math.max(1300, md * 2.2) && this.time - this.lastScare > 0.4) this.scare(x, y);
+      }
+
+      tap(x, y) {
+        this.addRipple(x, y, 1, true);
+        this.drops.push([x, y, Math.min(this.width, this.height) * 0.11, 0.9]);
+        this.food = { x, y, t0: this.time, life: 9 };
+        const diag = Math.hypot(this.width, this.height);
+        for (const f of this.fish) {
+          const d = Math.hypot(f.x - x, f.y - y);
+          f.hungry = f.fear < 0.3 && (f.curious * 0.6 + 0.55 - d / diag) > 0.35;
+        }
+      }
+
+      scare(x, y, wide) {
+        this.lastScare = this.time;
+        const md = Math.min(this.width, this.height);
+        const R = wide ? Math.hypot(this.width, this.height) * 0.45 : md * 0.42 + 120;
+        for (const f of this.fish) {
+          const dx = f.x - x, dy = f.y - y;
+          const d = Math.hypot(dx, dy);
+          if (d > R) continue;
+          const k = 1 - d / R;
+          const jitter = (Math.random() - 0.5) * 0.9;
+          let a = Math.atan2(dy, dx) + jitter;
+          f.fleeX = Math.cos(a); f.fleeY = Math.sin(a);
+          f.fear = Math.max(f.fear, 0.55 + 0.45 * k);
+          f.shy = 3 + Math.random() * 2;
+          f.hungry = false;
+          // a slap of the tail as it bolts
+          const ti = Math.round(N_SPINE * 0.8);
+          if (k > 0.3) this.addRipple(f.sx[ti] || f.x, f.sy[ti] || f.y, 0.35 + 0.3 * k, false);
+        }
+      }
+
+      addRipple(x, y, str, big) {
+        const md = Math.min(this.width, this.height);
+        const mk = (delay, s, rmax) => ({ x, y, t0: this.time + delay, str: s, rmax, tau: big ? 1.8 : 0.9, life: big ? 2.6 : 1.0, seed: Math.random() * 50 });
+        if (big) {
+          this.ripples.push(mk(0, str, md * 0.34));
+          this.ripples.push(mk(0.32, str * 0.6, md * 0.26));
+        } else {
+          this.ripples.push(mk(0, str, md * 0.07));
+        }
+        if (this.ripples.length > 10) this.ripples.splice(0, this.ripples.length - 10);
+      }
+
+      /* -------------------------------------------------------- SIMULATION */
+      _updateFish(dt) {
+        const t = this.time;
+        const W = this.width, H = this.height;
+        const md = Math.min(W, H);
+        const P = this.pointer;
+        const food = this.food;
+        const pointerLive = P.active && t - P.lastMove < 6;
+        for (const f of this.fish) {
+          const fx = Math.cos(f.h), fy = Math.sin(f.h);
+          let vx = fx, vy = fy;
+          let tgt = f.cruise;
+
+          // wandering
+          const wn = (noise2D(t * 0.09 + f.seed * 10, f.seed * 3.3) - 0.5) * 2.6;
+          vx += Math.cos(f.h + wn) * 0.7;
+          vy += Math.sin(f.h + wn) * 0.7;
+
+          // the pond's banks
+          const m = md * 0.07 + f.L * 0.4;
+          if (f.x < m) vx += (m - f.x) / m * 2.4 + Math.max(0, -f.x) / f.L * 6;
+          if (f.x > W - m) vx -= (f.x - (W - m)) / m * 2.4 + Math.max(0, f.x - W) / f.L * 6;
+          if (f.y < m) vy += (m - f.y) / m * 2.4 + Math.max(0, -f.y) / f.L * 6;
+          if (f.y > H - m) vy -= (f.y - (H - m)) / m * 2.4 + Math.max(0, f.y - H) / f.L * 6;
+
+          // the card is a sheet on the water: swim around it, never under it
+          if (this.card) {
+            const M = f.L * 0.22 + 10;
+            for (let q = 0; q < 2; q++) {
+              const px = q ? f.midX : f.x, py = q ? f.midY : f.y;
+              const sd = this.cardSd(px, py);
+              if (sd < M) {
+                const [nx, ny] = this.cardNormal(px, py);
+                const k = clamp(1 - sd / M, 0, 2.5) * 3.2;
+                vx += nx * k; vy += ny * k;
+              }
+            }
+          }
+
+          // invited to the card (typing, hovering it, or logging in): circle it
+          const invite = this.card && (this.mode === 'opening' || this.mode === 'loading' || this.mode === 'done' ||
+            ((this.focused || this.overCard) && f.curious > 0.3 && f.shy <= 0));
+          if (invite) {
+            const ring = f.L * 0.3 + 14 + f.curious * 26;
+            const sd = this.cardSd(f.x, f.y);
+            const [nx, ny] = this.cardNormal(f.x, f.y);
+            const err = clamp((sd - ring) / ring, -1, 1.5);
+            const w = this.mode === 'form' || this.mode === 'checking' ? 1 : 1.5;
+            vx += (-nx * err * 2.2 + -ny * f.orbitDir * 1.4) * w;
+            vy += (-ny * err * 2.2 + nx * f.orbitDir * 1.4) * w;
+            tgt = this.mode === 'loading' ? f.cruise * 1.25 : f.cruise * 0.8;
+          }
+
+          // give each other room
+          for (const g of this.fish) {
+            if (g === f) continue;
+            const R = 0.42 * (f.L + g.L);
+            for (let q = 0; q < 2; q++) {
+              const px = q ? g.midX : g.x, py = q ? g.midY : g.y;
+              const dx = f.x - px, dy = f.y - py;
+              const d = Math.hypot(dx, dy);
+              if (d < R && d > 0.01) {
+                const s = (1 - d / R) * 1.4;
+                vx += dx / d * s; vy += dy / d * s;
+              }
+            }
+          }
+
+          // curious about the cursor
+          if (pointerLive && !this.overCard && f.shy <= 0 && f.curious > 0.3 && !f.hungry) {
+            const dx = P.x - f.x, dy = P.y - f.y;
+            const d = Math.hypot(dx, dy) + 1e-3;
+            const want = f.L * 0.6;
+            const pull = (0.5 + f.curious) * 1.7 * smoothstep(want * 0.7, want * 2.4, d);
+            vx += dx / d * pull; vy += dy / d * pull;
+            if (d > want * 3.5) tgt = f.cruise * 1.35;
+            if (d < want * 2.2) {
+              vx += -dy / d * f.orbitDir * 0.9; vy += dx / d * f.orbitDir * 0.9;
+              tgt = f.cruise * 0.6;
+            }
+          }
+
+          // a drop on the water: something to eat
+          if (food && f.hungry) {
+            const dx = food.x - f.x, dy = food.y - f.y;
+            const d = Math.hypot(dx, dy) + 1e-3;
+            const near = f.L * 0.4;
+            vx += dx / d * 2.6 * smoothstep(near * 0.5, near * 1.6, d);
+            vy += dy / d * 2.6 * smoothstep(near * 0.5, near * 1.6, d);
+            tgt = d > near * 3 ? f.cruise * 1.5 : f.cruise * 0.55;
+            if (d < near * 1.8) {
+              vx += -dy / d * f.orbitDir * 1.1; vy += dx / d * f.orbitDir * 1.1;
+              f.nibble -= dt;
+              if (f.nibble < 0) {
+                f.nibble = 0.6 + Math.random() * 1.4;
+                this.addRipple(f.x + fx * f.L * 0.02, f.y + fy * f.L * 0.02, 0.45, false);
+              }
+            }
+          }
+
+          // fright
+          if (f.fear > 0) {
+            const k = Math.min(1, f.fear * 1.3);
+            vx = vx * (1 - k * 0.85) + f.fleeX * 3 * k;
+            vy = vy * (1 - k * 0.85) + f.fleeY * 3 * k;
+            tgt = lerp(tgt, f.L * 2.5, k);
+          }
+
+          const desired = Math.atan2(vy, vx);
+          const diff = wrapAngle(desired - f.h);
+          // turning radius never tighter than ~half a body, so the tail follows the head's path
+          const maxTurn = Math.max(0.3, f.v / (0.5 * f.L));
+          const turn = clamp(diff * 2.0, -maxTurn, maxTurn);
+          f.turn = lerp(f.turn, turn, 1 - Math.exp(-dt * (f.fear > 0.3 ? 9 : 4)));
+          f.h = wrapAngle(f.h + f.turn * dt);
+          tgt *= 1 - Math.min(0.35, Math.abs(f.turn) * 0.2);
+          f.v += (tgt - f.v) * (1 - Math.exp(-dt * (f.fear > 0.2 ? 5 : 1.1)));
+          f.x += Math.cos(f.h) * f.v * dt;
+          f.y += Math.sin(f.h) * f.v * dt;
+          f.fear = Math.max(0, f.fear - dt * 0.5);
+          f.shy -= dt;
+
+          // the path the head has swum, which the body follows
+          const tr = f.trail;
+          if (Math.hypot(f.x - tr[0][0], f.y - tr[0][1]) >= 3) tr.unshift([f.x, f.y]);
+          let len = Math.hypot(f.x - tr[0][0], f.y - tr[0][1]);
+          let cut = tr.length;
+          for (let i = 1; i < tr.length; i++) {
+            len += Math.hypot(tr[i][0] - tr[i - 1][0], tr[i][1] - tr[i - 1][1]);
+            if (len > f.L * 1.5) { cut = i + 1; break; }
+          }
+          if (cut < tr.length) tr.length = cut;
+
+          // swimming rhythm: faster, wider beats when it hurries
+          const rate = f.v / f.L;
+          f.phase += dt * Math.PI * 2 * (0.45 + rate * 1.15);
+          f.amp = lerp(f.amp, clamp(0.35 + rate * 0.9, 0.3, 1.5), 1 - Math.exp(-dt * 3));
+          f.finPhase += dt * (1.4 + rate * 2);
+          const spread = clamp(0.8 - rate * 1.4, 0, 1);
+          const fl = spread * (0.75 + 0.25 * Math.sin(f.finPhase));
+          f.flapL = lerp(f.flapL, clamp(fl + Math.max(0, f.turn) * 0.7, 0, 1), 1 - Math.exp(-dt * 6));
+          f.flapR = lerp(f.flapR, clamp(fl + Math.max(0, -f.turn) * 0.7, 0, 1), 1 - Math.exp(-dt * 6));
+
+          f.buildSpine();
+        }
+      }
+
+      _updateLeaves(dt) {
+        const t = this.time;
+        const W = this.width, H = this.height;
+        for (const l of this.leaves) {
+          // koi passing beneath nudge the leaf aside
+          for (const f of this.fish) {
+            for (let q = 0; q < 2; q++) {
+              const px = q ? f.midX : f.x, py = q ? f.midY : f.y;
+              const dx = l.x - px, dy = l.y - py;
+              const d = Math.hypot(dx, dy) + 1e-3;
+              const R = l.r + f.L * 0.18;
+              if (d < R) {
+                const k = (1 - d / R) * (f.v * 0.9 + 8) * (l.type === 2 ? 2.2 : 1) / Math.max(1, l.r / 40);
+                l.vx += dx / d * k * dt;
+                l.vy += dy / d * k * dt;
+                l.vr += ((Math.cos(f.h) * dy - Math.sin(f.h) * dx) / d) * k * dt * 0.004;
+                l.kick = Math.min(1, l.kick + k * dt * 0.02);
+              }
+            }
+          }
+          // ripples push outward as the ring passes
+          for (const r of this.ripples) {
+            if (r.R === undefined) continue;
+            const dx = l.x - r.x, dy = l.y - r.y;
+            const d = Math.hypot(dx, dy) + 1e-3;
+            if (Math.abs(d - r.R) < l.r * 0.8 && r.amp > 0.05) {
+              const k = r.amp * 26 * (l.type === 2 ? 2 : 1);
+              l.vx += dx / d * k * dt; l.vy += dy / d * k * dt;
+              l.kick = Math.min(1, l.kick + r.amp * dt * 2);
+            }
+          }
+          // leaves drift clear of the card
+          if (this.card) {
+            const sd = this.cardSd(l.x, l.y);
+            const M = l.r * (l.type === 2 ? 1.5 : 1.15) + 12;
+            if (sd < M) {
+              const [nx, ny] = this.cardNormal(l.x, l.y);
+              const k = (M - sd) * 3;
+              l.vx += nx * k * dt; l.vy += ny * k * dt;
+              if (l.type !== 2) { l.hx += nx * k * dt * 0.5; l.hy += ny * k * dt * 0.5; }
+            }
+          }
+          // leaves keep their distance from each other
+          for (const o of this.leaves) {
+            if (o === l || o.type === 2) continue;
+            const dx = l.x - o.x, dy = l.y - o.y;
+            const d = Math.hypot(dx, dy) + 1e-3;
+            const R = (l.r + o.r) * 0.92;
+            if (d < R) { const k = (R - d) * 1.5; l.vx += dx / d * k * dt; l.vy += dy / d * k * dt; }
+          }
+          if (l.type === 2) {
+            // a loose petal drifts on a slow current and wraps around the pond
+            l.vx += (noise2D(t * 0.05 + l.seed, 1.3) - 0.5) * 5 * dt;
+            l.vy += (noise2D(t * 0.05 + l.seed, 7.9) - 0.5) * 5 * dt;
+            const pad = l.r * 2;
+            if (l.x < -pad) l.x = W + pad; if (l.x > W + pad) l.x = -pad;
+            if (l.y < -pad) l.y = H + pad; if (l.y > H + pad) l.y = -pad;
+            l.vr += (noise2D(t * 0.1, l.seed) - 0.5) * 0.02 * dt;
+          } else {
+            // tethered by its stem: drifts aside, then slowly comes home
+            l.vx += (l.hx - l.x) * 0.012 * dt * 4;
+            l.vy += (l.hy - l.y) * 0.012 * dt * 4;
+          }
+          const damp = Math.exp(-dt * 0.9);
+          l.vx *= damp; l.vy *= damp; l.vr *= Math.exp(-dt * 0.6);
+          l.x += l.vx * dt; l.y += l.vy * dt; l.rot += l.vr * dt;
+          l.kick *= Math.exp(-dt * 1.5);
+        }
+      }
+
+      _updateRipples(dt) {
+        const t = this.time;
+        this.ripples = this.ripples.filter(r => t - r.t0 < r.life);
+        for (const r of this.ripples) {
+          const age = t - r.t0;
+          if (age < 0) { r.R = undefined; r.amp = 0; continue; }
+          r.R = 4 + r.rmax * (1 - Math.exp(-age / r.tau));
+          r.amp = r.str * Math.exp(-age / (r.life * 0.42)) * Math.min(1, age / 0.1);
+        }
+        if (this.food && t - this.food.t0 > this.food.life) {
+          this.food = null;
+          for (const f of this.fish) f.hungry = false;
+        }
+        // now and then a koi comes up to kiss the surface
+        if (t > this.nextKiss) {
+          this.nextKiss = t + 7 + Math.random() * 9;
+          const f = this.fish[(Math.random() * this.fish.length) | 0];
+          if (f && f.fear < 0.1) this.addRipple(f.x + Math.cos(f.h) * f.L * 0.03, f.y + Math.sin(f.h) * f.L * 0.03, 0.4, false);
+        }
+      }
+
+      /* --------------------------------------------------------- RENDERING */
+      _drawFish() {
+        const gl = this.gl;
+        const n = this.fish.length;
+        const per = N_SPINE * 2;
+        const need = n * per * FLOATS_PER_VERT;
+        if (!this.fishBuf || this.fishBuf.length < need) this.fishBuf = new Float32Array(need);
+        let off = 0;
+        for (const f of this.fish) off = f.writeVerts(this.fishBuf, off);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.fishT.fb);
+        gl.viewport(0, 0, this.fishT.w, this.fishT.h);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.ONE, gl.ONE);
+        const P = this.progFish;
+        gl.useProgram(P.p);
+        gl.uniform2f(P.u.uRes, this.width, this.height);
+        gl.uniform1f(P.u.uEnc, this.enc);
+        gl.bindVertexArray(this.fishGeo.vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.fishGeo.buf);
+        gl.bufferData(gl.ARRAY_BUFFER, this.fishBuf.subarray(0, off), gl.DYNAMIC_DRAW);
+        for (let i = 0; i < n; i++) gl.drawArrays(gl.TRIANGLE_STRIP, i * per, per);
+      }
+
+      _drawLeaves() {
+        const gl = this.gl;
+        const leaves = this.leaves;
+        const need = leaves.length * 6 * FLOATS_PER_VERT;
+        if (!this.leafBuf || this.leafBuf.length < need) this.leafBuf = new Float32Array(need);
+        const b = this.leafBuf;
+        let off = 0;
+        const t = this.time;
+        const corners = [[-1, -1], [1, -1], [-1, 1], [1, -1], [1, 1], [-1, 1]];
+        for (const l of leaves) {
+          const bob = 1 + 0.014 * Math.sin(t * 0.7 + l.bob) + 0.03 * l.kick * Math.sin(t * 6 + l.bob);
+          const rot = l.rot + 0.03 * Math.sin(t * 0.45 + l.bob * 2);
+          const ext = 1.12;
+          const R = l.r * bob * ext;
+          const c = Math.cos(rot), s = Math.sin(rot);
+          const sx = l.type === 2 ? 1 : 1, sy = l.type === 2 ? 0.45 : 1;
+          for (const [cx, cy] of corners) {
+            const lx = cx * ext, ly = cy * ext * sy;
+            const wx = cx * R * sx, wy = cy * R * sy;
+            b[off++] = l.x + wx * c - wy * s;
+            b[off++] = l.y + wx * s + wy * c;
+            b[off++] = lx; b[off++] = ly;
+            b[off++] = l.type; b[off++] = l.seed; b[off++] = t * 0.6 + l.bob; b[off++] = 0;
+            b[off++] = 0; b[off++] = 0; b[off++] = 0; b[off++] = 0;
+          }
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.leafT.fb);
+        gl.viewport(0, 0, this.leafT.w, this.leafT.h);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.ONE, gl.ONE);
+        const P = this.progLeaf;
+        gl.useProgram(P.p);
+        gl.uniform2f(P.u.uRes, this.width, this.height);
+        gl.bindVertexArray(this.leafGeo.vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.leafGeo.buf);
+        gl.bufferData(gl.ARRAY_BUFFER, b.subarray(0, off), gl.DYNAMIC_DRAW);
+        gl.drawArrays(gl.TRIANGLES, 0, off / FLOATS_PER_VERT);
+      }
+
+      _ripUniforms() {
+        if (!this._rip) { this._rip = new Float32Array(40); this._ripSeed = new Float32Array(10); }
+        let n = 0;
+        for (const r of this.ripples) {
+          if (r.R === undefined || r.amp < 0.004 || n >= 10) continue;
+          this._rip.set([r.x, r.y, r.R, r.amp], n * 4);
+          this._ripSeed[n] = r.seed;
+          n++;
+        }
+        return n;
+      }
+
+      _updateWet(dt) {
+        const gl = this.gl;
+        const P = this.progWet;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.wetB.fb);
+        gl.viewport(0, 0, this.wetB.w, this.wetB.h);
+        gl.disable(gl.BLEND);
+        gl.useProgram(P.p);
+        const bind = (unit, tex, loc) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(loc, unit); };
+        bind(0, this.wetA.tex[0], P.u.uPrev);
+        bind(1, this.fishT.tex[0], P.u.uFish0);
+        bind(2, this.fishT.tex[1], P.u.uFish1);
+        gl.uniform2f(P.u.uTexel, 1 / this.wetA.w, 1 / this.wetA.h);
+        gl.uniform2f(P.u.uRes, this.width, this.height);
+        gl.uniform1f(P.u.uDt, dt);
+        gl.uniform1f(P.u.uTime, this.time);
+        gl.uniform1f(P.u.uEnc, this.enc);
+        gl.uniform1f(P.u.uEncW, this.encW);
+        gl.uniform1f(P.u.uDither, this.dither);
+        gl.uniform1f(P.u.uWetRate, this.wetRate || 0.42);
+        gl.uniform1f(P.u.uDryTime, this.dryTime || 15);
+        const drops = new Float32Array(24);
+        const nd = Math.min(6, this.drops.length);
+        for (let i = 0; i < nd; i++) drops.set(this.drops[i], i * 4);
+        this.drops.length = 0;
+        gl.uniform4fv(P.u.uDrop, drops);
+        gl.uniform1i(P.u.uDropN, nd);
+        const nr = this._ripUniforms();
+        gl.uniform4fv(P.u.uRip, this._rip);
+        gl.uniform1i(P.u.uRipN, nr);
+        gl.bindVertexArray(this.vaoQuad);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        const tmp = this.wetA; this.wetA = this.wetB; this.wetB = tmp;
+      }
+
+      _compose() {
+        const gl = this.gl;
+        const P = this.progCompose;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.pigT.fb);
+        gl.viewport(0, 0, this.pigT.w, this.pigT.h);
+        gl.disable(gl.BLEND);
+        gl.useProgram(P.p);
+        const bind = (unit, tex, loc) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(loc, unit); };
+        bind(1, this.fishT.tex[0], P.u.uFish0);
+        bind(2, this.fishT.tex[1], P.u.uFish1);
+        bind(3, this.wetA.tex[0], P.u.uWet);
+        bind(4, this.leafT.tex[0], P.u.uLeaf);
+        bind(5, this.noiseT.tex[0], P.u.uNoise);
+        gl.uniform2f(P.u.uRes, this.width, this.height);
+        gl.uniform1f(P.u.uTime, this.time);
+        gl.uniform1f(P.u.uEnc, this.enc);
+        gl.uniform1f(P.u.uEncW, this.encW);
+        const nr = this._ripUniforms();
+        gl.uniform4fv(P.u.uRip, this._rip);
+        gl.uniform1fv(P.u.uRipSeed, this._ripSeed);
+        gl.uniform1i(P.u.uRipN, nr);
+        gl.uniform1i(P.u.uDbg, +(this.params.get('dbg') || 0));
+        const C = this.card;
+        gl.uniform4f(P.u.uCard, C ? C.x : 0, C ? C.y : 0, C ? C.w : 0, C ? C.h : 0);
+        gl.uniform1f(P.u.uCardR, C ? C.r : 0);
+        gl.bindVertexArray(this.vaoQuad);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        const F = this.progFinal;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+        gl.useProgram(F.p);
+        bind(0, this.paperT.tex[0], F.u.uPaper);
+        bind(1, this.pigT.tex[0], F.u.uPig);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      }
+
+      step(dt, render = true) {
+        if (!this.gl || !this.fish) return;
+        this.time += dt;
+        if (this.pointer.active && this.time - this.pointer.lastMove > 0.12) this.pointer.speed *= Math.exp(-dt * 10);
+        this._measureCard();
+        const P = this.pointer;
+        this.overCard = P.active && this.time - P.lastMove < 6 && this.cardSd(P.x, P.y) < 0;
+        this._updateCardFlow(dt);
+        this._updateRipples(dt);
+        this._updateFish(dt);
+        this._updateLeaves(dt);
+        const sk = this.skip || 0;
+        if (!(sk & 1)) this._drawFish();
+        if (!(sk & 2)) this._updateWet(dt);
+        if (render) {
+          if (!(sk & 4)) this._drawLeaves();
+          if (!(sk & 8)) this._compose();
+        }
+      }
+
+      _testApi() {
+        return {
+          run: (sec, fps = 60) => {
+            const n = Math.round(sec * fps);
+            for (let i = 0; i < n; i++) this.step(1 / fps, i === n - 1);
+            this.gl.finish();
+            return this.time;
+          },
+          bench: (n = 120) => {
+            const px = new Uint8Array(4);
+            const gl = this.gl;
+            this.step(1 / 60); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+            const t0 = performance.now();
+            for (let i = 0; i < n; i++) { this.step(1 / 60); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); }
+            return (performance.now() - t0) / n;
+          },
+          tap: (x, y) => this.tap(x, y),
+          move: (x, y) => {
+            this.pointer.active = true;
+            this.pointer.x = x; this.pointer.y = y; this.pointer.lastMove = this.time;
+          },
+          leave: () => { this.pointer.active = false; },
+          scare: (x, y) => this.scare(x, y),
+          focus: (on) => { this.focused = on; },
+          login: (email, pw) => { this.ui.email.value = email; this.ui.pw.value = pw; this._submit(); },
+          card: () => this.card,
+          set: (k, v) => { this[k] = v; },
+          state: () => ({
+            w: this.width, h: this.height, fish: this.fish.length, half: this.halfOK, enc: this.enc,
+            heads: this.fish.map(f => [Math.round(f.x), Math.round(f.y), +f.fear.toFixed(2)])
+          })
+        };
+      }
+    }
+
+    customElements.define('koi-login', KoiPond);
+  })();
+  </script>
+</body>
+</html>
